@@ -1,6 +1,9 @@
 docs/
 notes/
+media/
+scenes/
 wraith_full_project_document.docx
+/wraith
 
 # Prerequisites
 *.d
