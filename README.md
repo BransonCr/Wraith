@@ -2,8 +2,8 @@
 
 **Wraith** is a native x64 debugger for Linux, written in C directly on the
 `ptrace` syscall. It uses no debugging libraries — the DWARF parser,
-disassembler, and stack unwinder are all hand-written. It is built in the open
-as a long-form devlog series, one milestone per video.
+disassembler, and stack unwinder are all hand-written, claude is used for documentation
+and research for the project. It is built in the open as a long running project.
 
 ## Key Features
 
