@@ -1,8 +1,9 @@
 CC = cc
-CFLAGS = -Wall -Wextra -std=c11
+CFLAGS = -Wall -Wextra -std=c11 -Iinclude
+SRCS = $(wildcard src/*.c)
 
-wraith: src/main.c
-	$(CC) $(CFLAGS) -o wraith src/main.c
+wraith: $(SRCS)
+	$(CC) $(CFLAGS) -o wraith $(SRCS)
 run: wraith
 	./wraith
 
