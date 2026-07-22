@@ -1,5 +1,5 @@
 CC = cc
-CFLAGS = -Wall -Wextra -std=c11 -Iinclude
+CFLAGS = -Wall -Wextra -std=gnu11 -Iinclude
 SRCS = $(wildcard src/*.c)
 
 wraith: $(SRCS)
