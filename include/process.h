@@ -6,11 +6,14 @@
 // The name is arbitrary but must be unique across every header in the build,
 // hence the WRAITH_ prefix. (#pragma once does the same in one line, but is not
 // standard C, just universally supported.)
-#ifndef WRAITH_PROCESS_H
-#define WRAITH_PROCESS_H
+#ifndef WRAITH_PROCESS_H_
+#define WRAITH_PROCESS_H_
 
 #include <stdbool.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <sys/types.h>  // pid_t
+#include <sys/user.h>
 
 // Lifecycle of a traced process. Both launch and attach land in PROC_STOPPED.
 enum process_state {
@@ -24,22 +27,38 @@ enum process_state {
 // signal number (PROC_STOPPED / PROC_TERMINATED).
 struct stop_reason {
     enum process_state reason;
-    unsigned char info;
+    uint8_t info;
 };
+
 
 struct process {
+    struct user_regs_struct registers;
     pid_t pid;
     enum process_state state;
-    bool terminate_on_end;  // true if we spawned it, so we kill it on the way out
+    bool registers_valid;
+    bool terminate_on_end;
 };
 
-// Both return 0 on success, -1 on failure (message already printed via perror).
-// On success *out is filled in and the tracee is stopped.
 int process_launch(const char *path, struct process *out);
 int process_attach(pid_t pid, struct process *out);
 
+// Syscall budget: 1 (PTRACE_CONT), or 0 when the tracee is already gone.
+// Allocation: none.
 int process_resume(struct process *p);
-struct stop_reason process_wait(struct process *p);
-void process_detach(struct process *p);
 
+// Blocks until the tracee stops, exits, or dies, and updates p->state.
+// Syscall budget: 1 (waitpid), plus 1 per EINTR retry.
+// Allocation: none.
+struct stop_reason process_wait(struct process *p);
+
+// The register block for the current stop, or NULL on failure.
+// Syscall budget: 1 (PTRACE_GETREGSET) on the first call per stop, 0 after.
+// Allocation: none. The block lives inside *p.
+const struct user_regs_struct *process_registers(struct process *p);
+
+// Syscall budget: up to 6 (SIGSTOP, waitpid, DETACH, SIGCONT, SIGKILL, waitpid).
+// Allocation: none.
+int process_detach(struct process *p);
+
+bool process_gone(const struct process *p);
 #endif  // closes the #ifndef at the top of the file
