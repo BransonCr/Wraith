@@ -1,13 +1,31 @@
 CC = cc
 CFLAGS = -Wall -Wextra -std=gnu11 -Iinclude
+
 SRCS = $(wildcard src/*.c)
+
+# The test binary links every module except src/main.c, because
+# tests/test_process.c brings its own main().
+LIB_SRCS = $(filter-out src/main.c,$(SRCS))
+TEST_SRCS = $(wildcard tests/*.c)
+
+# The default target builds the debugger and then runs the suite. A binary that
+# compiles but fails its own tests is not a build, so `make` refuses to finish:
+# a failed assert aborts with a non-zero status and make stops here.
+all: wraith test
 
 wraith: $(SRCS)
 	$(CC) $(CFLAGS) -o wraith $(SRCS)
+
+wraith_test: $(LIB_SRCS) $(TEST_SRCS)
+	$(CC) $(CFLAGS) -o wraith_test $(LIB_SRCS) $(TEST_SRCS)
+
+test: wraith_test
+	./wraith_test
+
 run: wraith
 	./wraith
 
 clean:
-	rm -f wraith
+	rm -f wraith wraith_test
 
-.PHONY: run clean
+.PHONY: all test run clean

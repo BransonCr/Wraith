@@ -256,7 +256,6 @@ static int process_start(struct process *out, pid_t pid, bool terminate_on_end) 
     const struct stop_reason reason = process_wait(out);
     if (reason.reason != PROC_STOPPED) {
         // It died before we ever saw it stop, so there is nothing to debug.
-        // A clear failure beats a handle to a dead process.
         fprintf(stderr, "process %d never reached a stop\n", pid);
         out->pid = 0;
         return -1;
