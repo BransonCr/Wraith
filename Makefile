@@ -16,14 +16,19 @@ all: wraith test
 wraith: $(SRCS)
 	$(CC) $(CFLAGS) -o wraith $(SRCS)
 
-wraith_test: $(LIB_SRCS) $(TEST_SRCS)
-	$(CC) $(CFLAGS) -o wraith_test $(LIB_SRCS) $(TEST_SRCS)
+wraith_test_process: tests/test_process.c $(LIB_SRCS)
+	$(CC) $(CFLAGS) -o $@ $^
 
-test: wraith_test
-	./wraith_test
+wraith_test_registers: tests/test_registers.c $(LIB_SRCS)
+	$(CC) $(CFLAGS) -o $@ $^
+
+test: wraith_test_process wraith_test_registers
+	./wraith_test_process
+	./wraith_test_registers
 
 run: wraith
 	./wraith
+
 
 clean:
 	rm -f wraith wraith_test
