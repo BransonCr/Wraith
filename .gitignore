@@ -4,6 +4,7 @@ media/
 scenes/
 wraith_full_project_document.docx
 /wraith
+/wraith_test
 
 # Prerequisites
 *.d

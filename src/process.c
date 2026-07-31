@@ -28,7 +28,7 @@ static _Noreturn void process_launch_child_fail(int pipe_write, int error_number
 static pid_t process_wait_uninterrupted(pid_t pid, int *status);
 static int process_signal(pid_t pid, int signal_number);
 static int process_reap(pid_t pid);
-
+static int process_registers_flush(struct process *p);
 int process_launch(const char *path, struct process *out) {
     assert(path != NULL);
     assert(out != NULL);
@@ -106,6 +106,8 @@ int process_resume(struct process *p) {
     // a guaranteed-to-fail syscall into no syscall at all (6.1), and gives the
     // caller a better message than ESRCH.
     if (p->state == PROC_STOPPED) {
+        // The edit must reach the tracee before it runs again, or write the user
+        if (process_registers_flush(p) == -1) return -1;
         if (ptrace(PTRACE_CONT, p->pid, NULL, NULL) == -1) {
             perror("PTRACE_CONT");
             return -1;
@@ -125,6 +127,7 @@ struct stop_reason process_wait(struct process *p) {
 
     // Invalidate before the wait, not after: no path may read a register block
     // that describes a moment already gone (place-of-check to place-of-use).
+    p->registers_dirty = false;
     p->registers_valid = false;
 
     // If waitpid itself fails we do not know what the tracee is doing, so the
@@ -217,7 +220,8 @@ int process_detach(struct process *p) {
         if (process_signal(p->pid, SIGSTOP) == -1) result = -1;
         if (process_reap(p->pid) == -1) result = -1;
     }
-
+    // An edit is the users to keep even if tha last thing they did was detach
+    if(process_registers_flush(p) == -1) result = -1;
     if (ptrace(PTRACE_DETACH, p->pid, NULL, NULL) == -1) {
         perror("PTRACE_DETACH");
         result = -1;
@@ -338,6 +342,45 @@ static int process_reap(pid_t pid) {
     if (process_wait_uninterrupted(pid, &status) == -1) {
         perror("waitpid");
         return -1;
+    }
+    return 0;
+}
+
+int process_registers_set(struct process *p, const struct user_regs_struct *registers) {
+    assert(p != NULL);
+    assert(registers != NULL);
+    assert(p->pid > 0);
+
+    if (p->state == PROC_STOPPED) {
+        p->registers = *registers;
+        p->registers_dirty = true;
+        p->registers_valid = true;
+        return 0;
+    } else {
+        fprintf(stderr, "process %d is still running, its registers are in flight\n", p->pid);
+        return -1;
+    }
+}
+static int process_registers_flush(struct process *p) {
+    assert(p != NULL);
+    assert(p->pid > 0);
+
+    if(p->registers_dirty) {
+        assert(p->registers_valid);
+
+        //Mirror GETREGSET above, same not type, same explicit length so the kernel
+        //validate the size rather tahn trusting out layout
+        struct iovec block = {
+            .iov_base = &p->registers,
+            .iov_len = sizeof p->registers,
+        };
+        if (ptrace(PTRACE_SETREGSET, p->pid, (void *)(uintptr_t)NT_PRSTATUS, &block) == -1) {
+            perror("PTRACE_SETREGSET");
+            return -1;
+        }
+        assert(block.iov_len == sizeof p->registers);
+        p->registers_dirty = false;
+
     }
     return 0;
 }

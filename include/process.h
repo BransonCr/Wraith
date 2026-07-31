@@ -33,6 +33,7 @@ struct stop_reason {
 
 struct process {
     struct user_regs_struct registers;
+    bool registers_dirty;
     pid_t pid;
     enum process_state state;
     bool registers_valid;
@@ -59,6 +60,17 @@ const struct user_regs_struct *process_registers(struct process *p);
 // Syscall budget: up to 6 (SIGSTOP, waitpid, DETACH, SIGCONT, SIGKILL, waitpid).
 // Allocation: none.
 int process_detach(struct process *p);
+
+// Copies the caller's edited block into the stop cache and marks it dirty
+//n your milestone table. notes/index.md maps milestone 1 to book ch. 3+5 and milestone 2 to ch. 7+8 — nothing claims 6. I built what you described (registers wired to the command line), which is the natural close of ch. 5. If ch. 6 is something else in the book, say what and I'll scope it.
+
+// the tracee is not touched here: the flush is one PTRACE_SETREGSET. at the next
+// resume, so editing ten registers before continuing costs one syscall, not ten!!!
+// the UI layer never holds a mutable pointer into this cache so the cache
+// cannot go stale
+// no allocations
+// syscall budget: 0
+int process_registers_set(struct process *p, const struct user_regs_struct *registers);
 
 bool process_gone(const struct process *p);
 #endif  // closes the #ifndef at the top of the file
