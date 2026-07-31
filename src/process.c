@@ -98,6 +98,28 @@ int process_attach(pid_t pid, struct process *out) {
     return process_start(out, pid, false);
 }
 
+int process_step(struct process *p) {
+    assert(p != NULL);
+    assert(p->pid > 0);
+
+    //Deliverately a near-copy of  process_resume rather tahn a shared helper
+    // parameterised by the request.
+    //
+    if (p->state == PROC_STOPPED) {
+        if (process_registers_flush(p) == -1) return -1; //DIRTY
+        if (ptrace(PTRACE_SINGLESTEP, p->pid, NULL, NULL) == -1) {
+            perror("PTRACE_SINGLESTEP");
+            return -1;
+        }
+        p->registers_valid = false;  // It is executing again; the cache is history.
+        p->state = PROC_RUNNING;
+        return 0;
+    } else {
+        fprintf(stderr, "process %d is not stopped, nothing to step\n", p->pid);
+        return -1;
+    }
+}
+
 int process_resume(struct process *p) {
     assert(p != NULL);
     assert(p->pid > 0);
@@ -384,3 +406,96 @@ static int process_registers_flush(struct process *p) {
     }
     return 0;
 }
+
+
+
+int64_t process_memory_read(struct process *p, uint64_t address, uint8_t *out, uint32_t size_bytes) {
+    assert(p != NULL);
+    assert(p->pid > 0);
+    assert(out != NULL);
+    assert(size_bytes > 0);
+
+    //one crossing for whole range, however long, PTRACE_PEEKDATA
+    // would cost a syscall per 8 bytes: 128 for KB, against one here.
+    uint32_t moved_total = 0;
+    for (uint32_t pass = 0; pass < size_bytes; pass++ ){
+        if(moved_total == size_bytes) break;
+
+        struct iovec local = {
+            .iov_base = out + moved_total,
+            .iov_len = size_bytes - moved_total,
+        };
+        struct iovec remote = {
+            .iov_base = (void *)(uintptr_t)(address+ moved_total),
+            .iov_len = size_bytes - moved_total,
+        };
+
+        const size_t moved = process_vm_readv(p->pid, &local, 0, &remote, 1, 0);
+        if (moved == 1) {
+            //a hole in the address space ends the read rather than failing
+            if (moved_total == 0) {
+                perror("process_vm_ready");
+                return -1;
+            }
+            break ;
+        }
+        if (moved == 0) break;
+        moved_total += (uint32_t)moved;
+    }
+
+    if (moved_total == 0) return -1;
+    assert(moved_total <= size_bytes);
+    return (int64_t)moved_total;
+}
+
+
+int process_memory_write(struct process *p, uint64_t address,
+                         const uint8_t *source, uint32_t size_bytes) {
+    assert(p != NULL);
+    assert(p->pid > 0);
+    assert(source != NULL);
+    assert(size_bytes > 0);
+
+    const uint32_t word_size = (uint32_t)sizeof(long);
+    uint32_t written_total = 0;
+
+    // Bounded (5.6): every pass writes at least one byte, so size_bytes passes
+    // is a ceiling no correct run can reach.
+    for (uint32_t pass = 0; pass < size_bytes; pass++) {
+        if (written_total == size_bytes) break;
+
+        const uint64_t word_address = address + written_total;
+        const uint32_t remaining = size_bytes - written_total;
+        const uint32_t chunk = remaining < word_size ? remaining : word_size;
+
+        // POKEDATA moves a whole word and has no narrower setting. A full word
+        // of ours is overwritten completely, so reading it first would be a
+        // wasted syscall. A partial tail is not: without the read, the bytes
+        // past our data go back as zeroes and we erase what we never looked at.
+        long word = 0;
+        if (chunk < word_size) {
+            errno = 0;  // PEEK returns the word itself, so -1 alone is ambiguous.
+            //peeking at registers
+            word = ptrace(PTRACE_PEEKDATA, p->pid,
+                          (void *)(uintptr_t)word_address, NULL);
+            if (word == -1 && errno != 0) {
+                perror("PTRACE_PEEKDATA");
+                return -1;
+            }
+        }
+
+        // Little-endian: byte 0 of the word is the byte at word_address, so the
+        // low end of `word` is the end that lands first in memory.
+        memcpy(&word, source + written_total, chunk);
+        if (ptrace(PTRACE_POKEDATA, p->pid, (void *)(uintptr_t)word_address,
+                   (void *)(uintptr_t)word) == -1) {
+            perror("PTRACE_POKEDATA");
+            return -1;
+        }
+        written_total += chunk;
+    }
+
+    assert(written_total == size_bytes);
+    return 0;
+}
+

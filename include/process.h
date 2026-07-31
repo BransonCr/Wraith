@@ -73,4 +73,10 @@ int process_detach(struct process *p);
 int process_registers_set(struct process *p, const struct user_regs_struct *registers);
 
 bool process_gone(const struct process *p);
+
+
+int process_step(struct process *p);
+
+int64_t process_memory_read(struct process *p, uint64_t address, uint8_t *out, uint32_t size_bytes);
+int process_memory_write(struct process *p, uint64_t adress, const uint8_t *source, uint32_t size_bytes);
 #endif  // closes the #ifndef at the top of the file
