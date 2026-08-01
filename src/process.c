@@ -430,14 +430,14 @@ int64_t process_memory_read(struct process *p, uint64_t address, uint8_t *out, u
             .iov_len = size_bytes - moved_total,
         };
 
-        const size_t moved = process_vm_readv(p->pid, &local, 0, &remote, 1, 0);
-        if (moved == 1) {
-            //a hole in the address space ends the read rather than failing
+        const ssize_t moved = process_vm_readv(p->pid, &local, 1, &remote, 1, 0);
+        if (moved == -1) {
+            // A hole in the address space ends the read rather than failing.
             if (moved_total == 0) {
-                perror("process_vm_ready");
+                perror("process_vm_readv");   // typo'd "readv" as "ready"
                 return -1;
             }
-            break ;
+            break;
         }
         if (moved == 0) break;
         moved_total += (uint32_t)moved;

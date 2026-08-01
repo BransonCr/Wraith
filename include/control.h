@@ -28,9 +28,9 @@ struct control {
     uint32_t id_next;
 };
 
-
-int control_breakpoint_set(struct process *p, struct control *c, uint64_t address,
-                            uint32_t *out);
+void control_init(struct control *c);
+int control_breakpoint_set(struct control *c, struct process *p,
+                           uint64_t address, uint32_t *id_out);
 int control_breakpoint_enable(struct control *c, struct process *p, uint32_t id);
 int control_breakpoint_disable(struct control *c, struct process *p, uint32_t id);
 int control_breakpoint_delete(struct control *c, struct process *p, uint32_t id);

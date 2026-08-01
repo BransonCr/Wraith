@@ -7,168 +7,214 @@
 #include <control.h>
 
 #include <assert.h>
-#include <inttypes.h> // PRIx64
-#include <signal.h>   // SIGTRAP
-#include <stdio.h>    // fprintf
+#include <inttypes.h>  // PRIx64
+#include <signal.h>    // SIGTRAP
+#include <stdio.h>     // fprintf
 
 // Helpers, declared up front so a reader meets the entry points first.
-static struct control_breakpoint *control_find_by_id(struct control *c,
-                                                     uint32_t id);
-static struct control_breakpoint *control_find_by_address(struct control *c,
-                                                          uint64_t address);
-static int control_arm(struct control_breakpoint *breakpoint,
-                       struct process *p);
-static int control_disarm(struct control_breakpoint *breakpoint,
-                          struct process *p);
-static int control_step_over(struct control_breakpoint *breakpoint,
-                             struct process *p, struct stop_reason *reason_out);
+static struct control_breakpoint *control_find_by_id(struct control *c, uint32_t id);
+static struct control_breakpoint *control_find_by_address(struct control *c, uint64_t address);
+static int control_arm(struct control_breakpoint *breakpoint, struct process *p);
+static int control_disarm(struct control_breakpoint *breakpoint, struct process *p);
+static int control_step_over(struct control_breakpoint *breakpoint, struct process *p,
+                             struct stop_reason *reason_out);
 static void control_rewind(struct control *c, struct process *p);
 
 void control_init(struct control *c) {
-  assert(c != NULL);
+    assert(c != NULL);
 
-  *c = (struct control){
-      .count = 0,
-      .id_next = 1,
-  };
+    *c = (struct control){
+        .count = 0,
+        .id_next = 1,
+    };
+
+    assert(c->count == 0);
+    assert(c->id_next == 1);
 }
 
-int control_breakpoint_set(struct process *p, struct control *c,
-                           uint64_t address, uint32_t *id_out) {
-  assert(p != NULL);
-  assert(c != NULL);
-  assert(id_out != NULL);
-  assert(c->count < control_breakpoints_max);
+int control_breakpoint_set(struct control *c, struct process *p, uint64_t address,
+                           uint32_t *id_out) {
+    assert(c != NULL);
+    assert(p != NULL);
+    assert(id_out != NULL);
+    assert(c->count <= control_breakpoints_max);
 
-  if (c->count == control_breakpoints_max) {
-    fprintf(stderr, "breakpoint table is full (%d max)\n",
-            control_breakpoints_max);
-    return -1;
-  }
-  if (control_find_by_address(c, address) != NULL) {
-    fprintf(stderr, "breakpoint already set at 0x%016" PRIx64 "\n", address);
-    return -1;
-  }
+    // A full table is an operating error, not a programmer error, so it is
+    // reported rather than asserted: the user can delete a breakpoint and retry.
+    if (c->count == control_breakpoints_max) {
+        fprintf(stderr, "breakpoint table is full (%d max)\n", control_breakpoints_max);
+        return -1;
+    }
+    if (control_find_by_address(c, address) != NULL) {
+        fprintf(stderr, "breakpoint already set at 0x%016" PRIx64 "\n", address);
+        return -1;
+    }
 
-  struct control_breakpoint *breakpoint = &c->breakpoints[c->count];
-  *breakpoint = (struct control_breakpoint){
-      .address = address,
-      .id = c->id_next,
-      .original_byte = 0,
-      .enabled = true,
-  };
+    struct control_breakpoint *breakpoint = &c->breakpoints[c->count];
+    *breakpoint = (struct control_breakpoint){
+        .address = address,
+        .id = c->id_next,
+        .original_byte = 0,
+        .enabled = false,
+    };
 
-  if (control_arm(breakpoint, p) == -1)
-    return -1;
+    // The row is only counted once the trap is actually in the tracee. Counting
+    // first would leave a table entry claiming a breakpoint that is not armed.
+    if (control_arm(breakpoint, p) == -1) return -1;
+    assert(breakpoint->enabled);
 
-  *id_out = breakpoint->id;
-  c->count++;
-  c->id_next++;
-  return 0;
+    *id_out = breakpoint->id;
+    c->count++;
+    c->id_next++;
+    return 0;
 }
 
-int control_breakpoint_enable(struct control *c, struct process *p,
-                              uint32_t id) {
-  assert(p->pid > 0);
-  assert(c != NULL);
+int control_breakpoint_enable(struct control *c, struct process *p, uint32_t id) {
+    assert(c != NULL);
+    assert(p != NULL);
 
-  struct control_breakpoint *breakpoint = control_find_by_id(c, id);
-  if (breakpoint == NULL) {
-    fprintf(stderr, "breakpoint %d does not exist\n", id);
-    return -1;
-  }
+    struct control_breakpoint *breakpoint = control_find_by_id(c, id);
+    if (breakpoint == NULL) {
+        fprintf(stderr, "no breakpoint with id %u\n", id);
+        return -1;
+    }
 
-  if (breakpoint->enabled)
-    return 0; // already enabled
-  return control_arm(breakpoint, p);
+    if (breakpoint->enabled) return 0;  // Already armed, nothing to do.
+    return control_arm(breakpoint, p);
 }
 
-int control_breakpoint_delete(struct control *c, struct process *p,
-                              uint32_t id) {
-  assert(p->pid > 0);
-  assert(c != NULL);
-  assert(c->count <= control_breakpoints_max);
+int control_breakpoint_disable(struct control *c, struct process *p, uint32_t id) {
+    assert(c != NULL);
+    assert(p != NULL);
 
-  struct control_breakpoint *breakpoint = control_find_by_id(c, id);
-  if (breakpoint == NULL) {
-    fprintf(stderr, "no breakpoint with id %u\n", id);
-    return -1;
-  }
+    struct control_breakpoint *breakpoint = control_find_by_id(c, id);
+    if (breakpoint == NULL) {
+        fprintf(stderr, "no breakpoint with id %u\n", id);
+        return -1;
+    }
 
-  // put the programs own byte back before forgetting where went
-  if (breakpoint->enabled) {
-    if (control_disarm(breakpoint, p) == -1)
-      return -1;
-  }
+    // The row survives a disable, so the address and id stay stable and the
+    // user can re-enable without retyping either.
+    if (!breakpoint->enabled) return 0;  // Already disarmed, nothing to do.
+    return control_disarm(breakpoint, p);
+}
 
-  // Shift the tail down rather than swapping the last row in so 'list' keeps
-  //  its id order and a user reading it twice ses the same thing twice.
-  //  gotta come back to this one
-  const uint32_t position = (uint32_t)(breakpoint - c->breakpoints);
-  for (uint32_t i = position; i + 1 < c->count; i++) {
-    c->breakpoints[i] = c->breakpoints[i + 1];
-  }
-  c->count--;
-  return 0;
+int control_breakpoint_delete(struct control *c, struct process *p, uint32_t id) {
+    assert(c != NULL);
+    assert(p != NULL);
+    assert(c->count <= control_breakpoints_max);
+
+    struct control_breakpoint *breakpoint = control_find_by_id(c, id);
+    if (breakpoint == NULL) {
+        fprintf(stderr, "no breakpoint with id %u\n", id);
+        return -1;
+    }
+
+    // Put the program's own byte back before forgetting where it went. Losing
+    // the saved byte with the trap still planted would corrupt the tracee.
+    if (breakpoint->enabled) {
+        if (control_disarm(breakpoint, p) == -1) return -1;
+    }
+
+    // Shift the tail down rather than swapping the last row in, so 'list' keeps
+    // its id order and a user reading it twice sees the same thing twice.
+    const uint32_t position = (uint32_t)(breakpoint - c->breakpoints);
+    assert(position < c->count);
+    for (uint32_t i = position; i + 1 < c->count; i++) {
+        c->breakpoints[i] = c->breakpoints[i + 1];
+    }
+    c->count--;
+    return 0;
 }
 
 uint32_t control_breakpoints_count(const struct control *c) {
-  assert(c != NULL);
-  assert(c->count <= control_breakpoints_max);
-  return c->count;
-}
-const struct control_breakpoint *control_breakpoint_at(const struct control *c,
-                                                       uint32_t index) {
-  assert(c != NULL);
-  assert(index < c->count);
+    assert(c != NULL);
+    assert(c->count <= control_breakpoints_max);
 
-  return &c->breakpoints[index];
+    return c->count;
 }
 
-int control_continue(struct control *c, struct process *p,
-                     struct stop_reason *reason_out) {
-  assert(p != NULL);
-  assert(c != NULL);
-  assert(reason_out != NULL);
+const struct control_breakpoint *control_breakpoint_at(const struct control *c, uint32_t index) {
+    assert(c != NULL);
+    assert(index < c->count);
 
-  const struct user_regs_struct *registers = process_registers(p);
-  if (registers == NULL)
-    return -1;
+    return &c->breakpoints[index];
+}
 
-  // pass the RIP register which is the address of the next instruction
-  struct control_breakpoint *const here =
-      control_find_by_address(c, registers->rip);
-  if (here != NULL && here->enabled) {
-    if (control_step_over(here, p, reason_out) == -1)
-      return -1;
-    if (reason_out->reason == PROC_STOPPED)
-      return 0;
-  }
+// Stepping one instruction has the same problem as continuing: a 0xCC under rip
+// means the step executes the trap rather than the instruction it replaced.
+// Syscall budget: 2 (SINGLESTEP, waitpid), or 7 when rip sits on a breakpoint.
+// Allocation: none.
+int control_step(struct control *c, struct process *p, struct stop_reason *reason_out) {
+    assert(c != NULL);
+    assert(p != NULL);
+    assert(reason_out != NULL);
 
-  if (process_resume(p) == -1)
-    return -1;
-  *reason_out = process_wait(p);
-  if (reason_out->reason == PROC_STOPPED) {
-    if (reason_out->info == SIGTRAP) {
-      control_rewind(c, p);
+    const struct user_regs_struct *const registers = process_registers(p);
+    if (registers == NULL) return -1;
+
+    struct control_breakpoint *const here = control_find_by_address(c, registers->rip);
+    if (here != NULL) {
+        if (here->enabled) {
+            // control_step_over is exactly this operation, so hand the whole
+            // step to it rather than duplicating the disarm/step/re-arm dance.
+            return control_step_over(here, p, reason_out);
+        }
     }
-  }
-  return 0; // YAYAYYA
+
+    if (process_step(p) == -1) return -1;
+    *reason_out = process_wait(p);
+
+    // No rewind here. The CPU stops before executing a 0xCC it merely landed
+    // on, so rip is already the address the user wants to see.
+    return 0;
 }
-int64_t control_memory_read(const struct control *c, struct process *p,
-                            uint64_t address, uint8_t *out,
-                            uint32_t size_bytes) {
-  assert(p != NULL);
-  assert(c != NULL);
-  assert(out != NULL);
-  assert(size_bytes > 0);
 
-  const int64_t moved = process_memory_read(p, address, out, size_bytes);
-  if (moved <= 0)
-    return -1;
+int control_continue(struct control *c, struct process *p, struct stop_reason *reason_out) {
+    assert(c != NULL);
+    assert(p != NULL);
+    assert(reason_out != NULL);
 
-  control_unmask(c, address, out, size_bytes);
-  return moved;
+    const struct user_regs_struct *const registers = process_registers(p);
+    if (registers == NULL) return -1;
+
+    // rip is the address of the next instruction. If our trap is sitting there,
+    // it has to come out of the way for exactly one instruction before we run.
+    struct control_breakpoint *const here = control_find_by_address(c, registers->rip);
+    if (here != NULL) {
+        if (here->enabled) {
+            if (control_step_over(here, p, reason_out) == -1) return -1;
+
+            // Only a dead tracee ends the call here. A live one still needs the
+            // resume this function promised its caller.
+            if (process_gone(p)) return 0;
+        }
+    }
+
+    if (process_resume(p) == -1) return -1;
+    *reason_out = process_wait(p);
+
+    if (reason_out->reason == PROC_STOPPED) {
+        if (reason_out->info == SIGTRAP) {
+            control_rewind(c, p);
+        }
+    }
+    return 0;
+}
+
+int64_t control_memory_read(const struct control *c, struct process *p, uint64_t address,
+                            uint8_t *out, uint32_t size_bytes) {
+    assert(c != NULL);
+    assert(p != NULL);
+    assert(out != NULL);
+    assert(size_bytes > 0);
+
+    const int64_t moved = process_memory_read(p, address, out, size_bytes);
+    if (moved <= 0) return -1;
+    assert(moved <= (int64_t)size_bytes);
+
+    control_unmask(c, address, out, size_bytes);
+    return moved;
 }
 
 // The mirror of the read filter. A write landing on an armed breakpoint must
@@ -177,105 +223,107 @@ int64_t control_memory_read(const struct control *c, struct process *p,
 // slot, and the trap byte goes straight back over it in memory.
 int control_memory_write(struct control *c, struct process *p, uint64_t address,
                          const uint8_t *source, uint32_t size_bytes) {
-  assert(p != NULL);
-  assert(c != NULL);
-  assert(source != NULL);
-  assert(size_bytes > 0);
+    assert(c != NULL);
+    assert(p != NULL);
+    assert(source != NULL);
+    assert(size_bytes > 0);
+    assert(c->count <= control_breakpoints_max);
 
-  if (process_memory_write(p, address, source, size_bytes) == -1)
-    return -1;
+    if (process_memory_write(p, address, source, size_bytes) == -1) return -1;
 
-  for (uint32_t i = 0; i < size_bytes; i++) {
-    struct control_breakpoint *const breakpoint = &c->breakpoints[i];
-    if (!breakpoint->enabled)
-      continue;
-    if (breakpoint->address < address)
-      continue;
+    // Bounded by the breakpoint count, not by the byte count: the two are
+    // unrelated, and indexing the table by size_bytes reads past the array.
+    for (uint32_t i = 0; i < c->count; i++) {
+        struct control_breakpoint *const breakpoint = &c->breakpoints[i];
+        if (!breakpoint->enabled) continue;
+        if (breakpoint->address < address) continue;
 
-    const uint64_t offset = breakpoint->address - address;
-    if (offset >= size_bytes)
-      continue;
+        const uint64_t offset = breakpoint->address - address;
+        if (offset >= size_bytes) continue;
 
-    breakpoint->original_byte = source[offset];
-    const uint8_t trap = (uint8_t)control_int3;
-    if (process_memory_write(p, breakpoint->address, &trap, 1) == -1)
-      return -1;
-  }
-  return 0;
+        breakpoint->original_byte = source[offset];
+        const uint8_t trap = (uint8_t)control_int3;
+        if (process_memory_write(p, breakpoint->address, &trap, 1) == -1) return -1;
+    }
+    return 0;
 }
 
 void control_unmask(const struct control *c, uint64_t address, uint8_t *bytes,
                     uint32_t size_bytes) {
-  assert(c != NULL);
-  assert(bytes != NULL);
-  assert(c->count <= control_breakpoints_max);
+    assert(c != NULL);
+    assert(bytes != NULL);
+    assert(size_bytes > 0);
+    assert(c->count <= control_breakpoints_max);
 
-  for (uint32_t i = 0; i < c->count; i++) {
-    const struct control_breakpoint *const breakpoint = &c->breakpoints[i];
-    if (!breakpoint->enabled)
-      continue;
+    for (uint32_t i = 0; i < c->count; i++) {
+        const struct control_breakpoint *const breakpoint = &c->breakpoints[i];
+        if (!breakpoint->enabled) continue;
 
-    // guarding low side first is not declaration: unsiged substraction
-    // below the start of the range wraps to something near 2^64, and bounds
-    // check after it would pass
-    if (breakpoint->address < address)
-      continue;
+        // Guarding the low side first is not decoration: unsigned subtraction
+        // below the start of the range wraps to something near 2^64, and a
+        // bounds check after it would pass.
+        if (breakpoint->address < address) continue;
 
-    const uint64_t offset = breakpoint->address - address;
-    if (offset >= size_bytes)
-      continue;
+        const uint64_t offset = breakpoint->address - address;
+        if (offset >= size_bytes) continue;
 
-    bytes[offset] = breakpoint->original_byte;
-  }
+        bytes[offset] = breakpoint->original_byte;
+    }
 }
 
-// Syscall budget: 3 (readv, then peek + poke for the partial word).
-static int control_arm(struct control_breakpoint *breakpoint,
-                       struct process *p) {
-  assert(breakpoint != NULL);
-  assert(p != NULL);
-  assert(breakpoint->enabled);
-  const uint8_t trap = (uint8_t)control_int3;
-  if (process_memory_write(p, breakpoint->address,&trap, 1) == -1)
-    return -1;
+// Syscall budget: 4 (readv for the original byte, then peek + poke to plant the
+// trap, then the peek half of the read-modify-write).
+// Allocation: none.
+static int control_arm(struct control_breakpoint *breakpoint, struct process *p) {
+    assert(breakpoint != NULL);
+    assert(p != NULL);
+    assert(!breakpoint->enabled);
 
-  breakpoint->enabled = false;
-  return 0;
-}
-// Syscall budget: 2 (peek + poke).
-static int control_disarm(struct control_breakpoint *breakpoint,
-                          struct process *p) {
-  assert(breakpoint != NULL);
-  assert(p != NULL);
-  assert(breakpoint->enabled);
+    // Read before write. The other order saves 0xCC as the program's byte, and
+    // the tracee then traps forever at the same address.
+    uint8_t original = 0;
+    if (process_memory_read(p, breakpoint->address, &original, 1) != 1) return -1;
+    assert(original != control_int3);  // Double-arming would overwrite the saved byte.
 
-  if (process_memory_write(p, breakpoint->address, &breakpoint->original_byte,
-                           1) == -1) {
-    return -1;
-  }
-  breakpoint->enabled = false;
-  return 0;
-}
+    const uint8_t trap = (uint8_t)control_int3;
+    if (process_memory_write(p, breakpoint->address, &trap, 1) == -1) return -1;
 
-// Syscall budget: 7 (2 disarm, 1 SINGLESTEP, 1 waitpid, 3 re-arm).
-static int control_step_over(struct control_breakpoint *breakpoint,
-                             struct process *p,
-                             struct stop_reason *reason_out) {
-  assert(breakpoint != NULL);
-  assert(p != NULL);
-  assert(reason_out != NULL);
-  assert(breakpoint->enabled);
-
-  if (control_disarm(breakpoint, p) == -1)
-    return -1;
-  if (process_step(p) == -1)
-    return -1;
-  *reason_out = process_wait(p);
-
-  if (reason_out->reason == PROC_STOPPED)
+    breakpoint->original_byte = original;
+    breakpoint->enabled = true;
     return 0;
+}
 
-  return control_arm(breakpoint, p);
+// Syscall budget: 2 (peek + poke).
+// Allocation: none.
+static int control_disarm(struct control_breakpoint *breakpoint, struct process *p) {
+    assert(breakpoint != NULL);
+    assert(p != NULL);
+    assert(breakpoint->enabled);
+
+    if (process_memory_write(p, breakpoint->address, &breakpoint->original_byte, 1) == -1) {
+        return -1;
+    }
+    breakpoint->enabled = false;
+    return 0;
+}
+
+// Syscall budget: 8 (2 disarm, 1 SINGLESTEP, 1 waitpid, 4 re-arm).
+// Allocation: none.
+static int control_step_over(struct control_breakpoint *breakpoint, struct process *p,
+                             struct stop_reason *reason_out) {
+    assert(breakpoint != NULL);
+    assert(p != NULL);
+    assert(reason_out != NULL);
+    assert(breakpoint->enabled);
+
+    if (control_disarm(breakpoint, p) == -1) return -1;
+    if (process_step(p) == -1) return -1;
+    *reason_out = process_wait(p);
+
+    // Re-arm whenever there is still a tracee to write to. Skipping the re-arm
+    // on a live process loses the breakpoint silently after its first hit.
+    if (process_gone(p)) return 0;
+    return control_arm(breakpoint, p);
 }
 
 // A trap leaves rip one byte past the 0xCC, because int3 is a trap and not a
@@ -287,51 +335,53 @@ static int control_step_over(struct control_breakpoint *breakpoint,
 // (128), not TRAP_BRKPT (1) — measured. So ask a question that does have an
 // exact answer: is the byte we just ran off the end of one of ours?
 static void control_rewind(struct control *c, struct process *p) {
-  assert(c != NULL);
-  assert(p != NULL);
+    assert(c != NULL);
+    assert(p != NULL);
 
-  const struct user_regs_struct *registers = process_registers(p);
-  if (registers == NULL)
-    return;
-  if (registers->rip == 0)
-    return; // edge case nothing executes at -1 blud bomba
-            //
-  const uint64_t hit = registers->rip - 1;
-  const struct control_breakpoint *const breakpoint =
-      control_find_by_address(c, hit);
-  if (breakpoint == NULL)
-    return;
-  if (!breakpoint->enabled)
-    return;
+    const struct user_regs_struct *const registers = process_registers(p);
+    if (registers == NULL) return;
 
-  struct user_regs_struct block = *registers;
-  block.rip = hit;
-  if (process_registers_set(p, &block) == -1) {
-    fprintf(stderr, "Count not rewind rip onto the breakpoint\n");
-  }
+    // Nothing executes at address 0, and rip - 1 there would wrap to 2^64 - 1.
+    if (registers->rip == 0) return;
+
+    const uint64_t hit = registers->rip - 1;
+    const struct control_breakpoint *const breakpoint = control_find_by_address(c, hit);
+    if (breakpoint == NULL) return;
+    if (!breakpoint->enabled) return;
+
+    // Edit a copy and hand the whole block down, so process owns when the
+    // register block crosses the kernel boundary.
+    struct user_regs_struct block = *registers;
+    block.rip = hit;
+    if (process_registers_set(p, &block) == -1) {
+        fprintf(stderr, "could not rewind rip onto the breakpoint\n");
+    }
 }
 
-static struct control_breakpoint *control_find_by_id(struct control *c,
-                                                     uint32_t id) {
-  assert(c != NULL);
-  assert(c->count <= control_breakpoints_max);
+static struct control_breakpoint *control_find_by_id(struct control *c, uint32_t id) {
+    assert(c != NULL);
+    assert(c->count <= control_breakpoints_max);
 
-  for (uint32_t i = 0; i < c->count; i++) {
-    if (c->breakpoints[i].id == id)
-      return &c->breakpoints[i];
-  }
-  return NULL; // not found
+    for (uint32_t index = 0; index < c->count; index++) {
+        if (c->breakpoints[index].id == id) return &c->breakpoints[index];
+    }
+    return NULL;
 }
 
-// A linear scan, not the sorted parallel address array
-static struct control_breakpoint *control_find_by_address(struct control *c,
-                                                          uint64_t address) {
-  assert(c != NULL);
-  assert(c->count <= control_breakpoints_max);
+// A linear scan over the records, not the sorted parallel address array that
+// PERFORMANCE.md 8.5 asks for. Deliberate: this runs once per stop over at most
+// control_breakpoints_max entries, which is two cache lines of addresses, and
+// 8.4 says a linear pass wins below sixteen elements anyway.
+//
+// Upgrade trigger: raise control_breakpoints_max above 64, or start calling
+// this per instruction rather than per stop. Either one makes the sorted
+// uint64_t array and a binary search the right shape.
+static struct control_breakpoint *control_find_by_address(struct control *c, uint64_t address) {
+    assert(c != NULL);
+    assert(c->count <= control_breakpoints_max);
 
-  for (uint32_t index = 0; index < c->count; index++) {
-    if (c->breakpoints[index].address == address)
-      return &c->breakpoints[index];
-  }
-  return NULL;
+    for (uint32_t index = 0; index < c->count; index++) {
+        if (c->breakpoints[index].address == address) return &c->breakpoints[index];
+    }
+    return NULL;
 }
