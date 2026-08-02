@@ -11,7 +11,6 @@
 #include <signal.h>    // SIGTRAP
 #include <stdio.h>     // fprintf
 
-// Helpers, declared up front so a reader meets the entry points first.
 static struct control_breakpoint *control_find_by_id(struct control *c, uint32_t id);
 static struct control_breakpoint *control_find_by_address(struct control *c, uint64_t address);
 static int control_arm(struct control_breakpoint *breakpoint, struct process *p);
@@ -39,8 +38,6 @@ int control_breakpoint_set(struct control *c, struct process *p, uint64_t addres
     assert(id_out != NULL);
     assert(c->count <= control_breakpoints_max);
 
-    // A full table is an operating error, not a programmer error, so it is
-    // reported rather than asserted: the user can delete a breakpoint and retry.
     if (c->count == control_breakpoints_max) {
         fprintf(stderr, "breakpoint table is full (%d max)\n", control_breakpoints_max);
         return -1;
@@ -58,8 +55,6 @@ int control_breakpoint_set(struct control *c, struct process *p, uint64_t addres
         .enabled = false,
     };
 
-    // The row is only counted once the trap is actually in the tracee. Counting
-    // first would leave a table entry claiming a breakpoint that is not armed.
     if (control_arm(breakpoint, p) == -1) return -1;
     assert(breakpoint->enabled);
 
@@ -110,8 +105,6 @@ int control_breakpoint_delete(struct control *c, struct process *p, uint32_t id)
         return -1;
     }
 
-    // Put the program's own byte back before forgetting where it went. Losing
-    // the saved byte with the trap still planted would corrupt the tracee.
     if (breakpoint->enabled) {
         if (control_disarm(breakpoint, p) == -1) return -1;
     }
@@ -141,8 +134,6 @@ const struct control_breakpoint *control_breakpoint_at(const struct control *c, 
     return &c->breakpoints[index];
 }
 
-// Stepping one instruction has the same problem as continuing: a 0xCC under rip
-// means the step executes the trap rather than the instruction it replaced.
 // Syscall budget: 2 (SINGLESTEP, waitpid), or 7 when rip sits on a breakpoint.
 // Allocation: none.
 int control_step(struct control *c, struct process *p, struct stop_reason *reason_out) {
@@ -179,7 +170,6 @@ int control_continue(struct control *c, struct process *p, struct stop_reason *r
     if (registers == NULL) return -1;
 
     // rip is the address of the next instruction. If our trap is sitting there,
-    // it has to come out of the way for exactly one instruction before we run.
     struct control_breakpoint *const here = control_find_by_address(c, registers->rip);
     if (here != NULL) {
         if (here->enabled) {
@@ -217,8 +207,6 @@ int64_t control_memory_read(const struct control *c, struct process *p, uint64_t
     return moved;
 }
 
-// The mirror of the read filter. A write landing on an armed breakpoint must
-// change what the program will execute once the breakpoint is gone, not erase
 // the 0xCC that makes the breakpoint work. So the new byte goes into the saved
 // slot, and the trap byte goes straight back over it in memory.
 int control_memory_write(struct control *c, struct process *p, uint64_t address,
@@ -326,14 +314,6 @@ static int control_step_over(struct control_breakpoint *breakpoint, struct proce
     return control_arm(breakpoint, p);
 }
 
-// A trap leaves rip one byte past the 0xCC, because int3 is a trap and not a
-// fault: the CPU saves the address of the NEXT instruction, the one after the
-// byte that just ran. Undo that here, so no layer above ever learns the tax
-// exists.
-//
-// si_code cannot make this decision. On this kernel an int3 reports SI_KERNEL
-// (128), not TRAP_BRKPT (1) — measured. So ask a question that does have an
-// exact answer: is the byte we just ran off the end of one of ours?
 static void control_rewind(struct control *c, struct process *p) {
     assert(c != NULL);
     assert(p != NULL);
@@ -349,8 +329,6 @@ static void control_rewind(struct control *c, struct process *p) {
     if (breakpoint == NULL) return;
     if (!breakpoint->enabled) return;
 
-    // Edit a copy and hand the whole block down, so process owns when the
-    // register block crosses the kernel boundary.
     struct user_regs_struct block = *registers;
     block.rip = hit;
     if (process_registers_set(p, &block) == -1) {
@@ -368,11 +346,6 @@ static struct control_breakpoint *control_find_by_id(struct control *c, uint32_t
     return NULL;
 }
 
-// A linear scan over the records, not the sorted parallel address array that
-// PERFORMANCE.md 8.5 asks for. Deliberate: this runs once per stop over at most
-// control_breakpoints_max entries, which is two cache lines of addresses, and
-// 8.4 says a linear pass wins below sixteen elements anyway.
-//
 // Upgrade trigger: raise control_breakpoints_max above 64, or start calling
 // this per instruction rather than per stop. Either one makes the sorted
 // uint64_t array and a binary search the right shape.
