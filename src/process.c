@@ -8,6 +8,7 @@
 
 #include <process.h>
 
+#include <string.h>  // Already present, for strerror. memcpy needs it too.
 #include <assert.h>
 #include <errno.h>
 #include <stdint.h>
@@ -23,6 +24,7 @@
 #include <unistd.h>     // fork, execlp, pipe2, read, write, close, _exit
 
 // Helpers, declared up front so a reader meets the entry points first.
+static void process_stop_classify(pid_t pid, int signal_number, struct stop_reason *reason_out);
 static int process_start(struct process *out, pid_t pid, bool terminate_on_end);
 static _Noreturn void process_launch_child_fail(int pipe_write, int error_number);
 static pid_t process_wait_uninterrupted(pid_t pid, int *status);
@@ -50,9 +52,19 @@ int process_launch(const char *path, struct process *out) {
         return -1;
     }
 
-    if (pid == 0) {
+     if (pid == 0) {
         // --- CHILD ---
         close(status_pipe[0]);
+
+        // Leave wraith's process group before exec, so the terminal's ctrl-C
+        // reaches only the debugger. Otherwise the tty delivers SIGINT to the
+        // tracee directly and races the SIGSTOP the handler is sending it.
+        // The cost is that the tracee is no longer the foreground group, so a
+        // debuggee that reads from the terminal now earns SIGTTIN.
+        if (setpgid(0, 0) == -1) {
+            process_launch_child_fail(status_pipe[1], errno);
+        }
+
         if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1) {
             process_launch_child_fail(status_pipe[1], errno);
         }
@@ -98,20 +110,20 @@ int process_attach(pid_t pid, struct process *out) {
     return process_start(out, pid, false);
 }
 
-int process_step(struct process *p) {
+int process_step(struct process *p, int signal_number) {
     assert(p != NULL);
     assert(p->pid > 0);
+    assert(signal_number >= 0);
 
-    //Deliverately a near-copy of  process_resume rather tahn a shared helper
-    // parameterised by the request.
-    //
     if (p->state == PROC_STOPPED) {
-        if (process_registers_flush(p) == -1) return -1; //DIRTY
-        if (ptrace(PTRACE_SINGLESTEP, p->pid, NULL, NULL) == -1) {
+        if (process_registers_flush(p) == -1) return -1;
+        if (ptrace(PTRACE_SINGLESTEP, p->pid, NULL,
+                   (void *)(uintptr_t)signal_number) == -1) {
             perror("PTRACE_SINGLESTEP");
             return -1;
         }
         p->registers_valid = false;  // It is executing again; the cache is history.
+        p->syscall_valid = false;
         p->state = PROC_RUNNING;
         return 0;
     } else {
@@ -120,21 +132,24 @@ int process_step(struct process *p) {
     }
 }
 
-int process_resume(struct process *p) {
+int process_resume(struct process *p, int signal_number) {
     assert(p != NULL);
     assert(p->pid > 0);
+    assert(signal_number >= 0);
 
     // A tracee that has exited cannot be continued. Checking state first turns
     // a guaranteed-to-fail syscall into no syscall at all (6.1), and gives the
     // caller a better message than ESRCH.
     if (p->state == PROC_STOPPED) {
-        // The edit must reach the tracee before it runs again, or write the user
+        // The edit must reach the tracee before it runs again.
         if (process_registers_flush(p) == -1) return -1;
-        if (ptrace(PTRACE_CONT, p->pid, NULL, NULL) == -1) {
+        if (ptrace(PTRACE_CONT, p->pid, NULL,
+                   (void *)(uintptr_t)signal_number) == -1) {
             perror("PTRACE_CONT");
             return -1;
         }
-        p->registers_valid = false;  // It is executing again; the cache is history.
+        p->registers_valid = false;
+        p->syscall_valid = false;
         p->state = PROC_RUNNING;
         return 0;
     } else {
@@ -143,6 +158,31 @@ int process_resume(struct process *p) {
     }
 }
 
+// A third near-copy rather than a request parameter, for the same reason
+// process_step is one: the ptrace request stays readable at the call site, and
+// the caller's choice between cheap and expensive resume is a branch the caller
+// writes rather than a flag it fills in.
+int process_resume_syscall(struct process *p, int signal_number) {
+    assert(p != NULL);
+    assert(p->pid > 0);
+    assert(signal_number >= 0);
+
+    if (p->state == PROC_STOPPED) {
+        if (process_registers_flush(p) == -1) return -1;
+        if (ptrace(PTRACE_SYSCALL, p->pid, NULL,
+                   (void *)(uintptr_t)signal_number) == -1) {
+            perror("PTRACE_SYSCALL");
+            return -1;
+        }
+        p->registers_valid = false;
+        p->syscall_valid = false;
+        p->state = PROC_RUNNING;
+        return 0;
+    } else {
+        fprintf(stderr, "process %d is not stopped, nothing to continue\n", p->pid);
+        return -1;
+    }
+}
 struct stop_reason process_wait(struct process *p) {
     assert(p != NULL);
     assert(p->pid > 0);
@@ -171,9 +211,9 @@ struct stop_reason process_wait(struct process *p) {
             reason.reason = PROC_TERMINATED;
             reason.info = (uint8_t)WTERMSIG(status);
         } else {
-            if (WIFSTOPPED(status)) {
+            if(WIFSTOPPED(status)) {
                 reason.reason = PROC_STOPPED;
-                reason.info = (uint8_t)WSTOPSIG(status);
+                process_stop_classify(p->pid, WSTOPSIG(status), &reason);
             } else {
                 assert(false);  // Our reading of the status word is wrong.
             }
@@ -181,8 +221,46 @@ struct stop_reason process_wait(struct process *p) {
     }
 
     assert(reason.reason != PROC_RUNNING);
+    p-> syscall_valid = false;
     p->state = reason.reason;
     return reason;
+}
+
+static void process_stop_classify(pid_t pid, int signal_number,
+                                  struct stop_reason *reason_out) {
+    assert(pid > 0);
+    assert(signal_number > 0);
+    assert(reason_out != NULL);
+
+    reason_out->trap = PROC_TRAP_NONE;
+
+    if (signal_number == (SIGTRAP | 0x80)) {
+        reason_out->trap = PROC_TRAP_SYSCALL;
+        reason_out->info = SIGTRAP;
+        return;
+    }
+
+    reason_out->info = (uint8_t)signal_number;
+    if (signal_number != SIGTRAP) return;  // Not a trap, so nothing to classify.
+
+    siginfo_t information = {0};
+    if (ptrace(PTRACE_GETSIGINFO, pid, NULL, &information) == -1) {
+        perror("PTRACE_GETSIGINFO");
+        reason_out->trap = PROC_TRAP_UNKNOWN;
+        return;
+    }
+    assert(information.si_signo == SIGTRAP);
+
+    if (information.si_code == SI_KERNEL) {
+        reason_out->trap = PROC_TRAP_BREAKPOINT;
+        return;
+    }
+    if (information.si_code == TRAP_TRACE) {
+        reason_out->trap = PROC_TRAP_STEP;
+        return;
+    }
+
+    reason_out->trap = PROC_TRAP_UNKNOWN;
 }
 
 const struct user_regs_struct *process_registers(struct process *p) {
@@ -211,6 +289,66 @@ const struct user_regs_struct *process_registers(struct process *p) {
         fprintf(stderr, "process %d is running, its registers are in flight\n", p->pid);
         return NULL;
     }
+}
+
+//syscall result grabber, system call exit recorder.
+//
+const struct process_syscall *process_syscall(struct process *p) {
+
+    //example usage,
+    //write(fd, "hello", 5);
+    //p->syscall = (struct process_syscall){
+    //     .result = 5,                 // information.exit.rval (5 bytes successfully written)
+    //     .number = 1,                 // registers->orig_rax (Syscall #1 is 'write')
+    //     .entry = false,              // Mark as an exit event
+    //     .error = false,              // information.exit.is_error (no error occurred)
+    // };
+    assert(p != NULL);
+    assert(p->pid > 0);
+
+    if (p->syscall_valid) return &p->syscall;
+    if(p->state != PROC_STOPPED) return NULL;
+
+    //Kernel reports entry against exit itself, in this one field.
+    struct __ptrace_syscall_info information = {0};
+    if(ptrace(PTRACE_GET_SYSCALL_INFO, p->pid, (void *)(uintptr_t) sizeof information, &information) == -1) {
+        perror("PTRACE_GET_SYSCALL_INFO");
+        return NULL;
+    }
+
+       if (information.op == PTRACE_SYSCALL_INFO_ENTRY) {
+        p->syscall = (struct process_syscall){
+            .number = (uint16_t)information.entry.nr,
+            .entry = true,
+        };
+        static_assert(sizeof p->syscall.arguments == sizeof information.entry.args,
+                      "six 64-bit arguments, both sides");
+        memcpy(p->syscall.arguments, information.entry.args,
+               sizeof p->syscall.arguments);
+    } else {
+        // op is NONE at every stop that is not a syscall stop, which is also
+        // what it reports if TRACESYSGOOD was never set: the kernel derives
+        // entry-against-exit from the same bit the option controls.
+        if (information.op != PTRACE_SYSCALL_INFO_EXIT) return NULL;
+
+        // The exit record carries the return value but not the number. That
+        // still lives in orig_rax, which the kernel preserves across the call
+        // precisely so a tracer can ask what the syscall was on the way out.
+        const struct user_regs_struct *const registers = process_registers(p);
+        if (registers == NULL) return NULL;
+
+        p->syscall = (struct process_syscall){
+            .result = information.exit.rval,
+            .number = (uint16_t)registers->orig_rax,
+            .entry = false,
+            .error = information.exit.is_error != 0,
+        };
+    }
+
+    // One success tail for both branches. Putting it inside the else is how the
+    // entry path came to fill the cache and then report nothing was there.
+    p->syscall_valid = true;
+    return &p->syscall;
 }
 
 bool process_gone(const struct process *p) {
@@ -287,18 +425,15 @@ static int process_start(struct process *out, pid_t pid, bool terminate_on_end) 
         return -1;
     }
 
-    // 6.6: options are per-tracee state, set once here and never per stop.
-    // EXITKILL only for a process we spawned. Killing one we merely attached
-    // to, because our own process ended, is not ours to do.
-    if (terminate_on_end) {
-        if (ptrace(PTRACE_SETOPTIONS, pid, NULL,
-                   (void *)(uintptr_t)PTRACE_O_EXITKILL) == -1) {
-            perror("PTRACE_SETOPTIONS");
-            return -1;
-        }
+
+    const int options = terminate_on_end
+        ? (PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL)
+        : PTRACE_O_TRACESYSGOOD;
+    if (ptrace(PTRACE_SETOPTIONS, pid, NULL, (void *)(uintptr_t)options) == -1) {
+        perror("PTRACE_SETOPTIONS");
+        return -1;
     }
 
-    assert(out->state == PROC_STOPPED);
     return 0;
 }
 

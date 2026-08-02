@@ -5,6 +5,7 @@
 // command line looks like. Everything below it speaks in structs. It is also
 // the only layer that holds both the process and the breakpoint table, which is
 // why every control_* call in the program starts here.
+#include <signal.h>     // SIGTRAP
 #include <assert.h>
 #include <errno.h>
 #include <inttypes.h>   // PRIx64
@@ -13,6 +14,7 @@
 #include <stdio.h>      // printf, fgets, fprintf, perror
 #include <stdlib.h>     // strtol, strtoul, strtoull
 #include <string.h>     // strcmp, strncmp, strlen, strcspn, strsignal
+#include <ctype.h>      // isspace
 
 #include <sys/types.h>  // pid_t
 #include <sys/user.h>   // struct user_regs_struct
@@ -21,10 +23,12 @@
 #include <disassembler.h>
 #include <process.h>
 #include <registers.h>
+#include <syscall.h>
 
 enum {
     main_command_length_bytes_max = 256,
 
+    main_syscall_name_bytes_max = 32,
     main_words_max = 8,
 
     main_memory_bytes_max = 1024,
@@ -43,6 +47,11 @@ static void command_handle(struct control *c, struct process *p, char *command);
 static uint32_t command_split(char *command, char *words[], uint32_t words_max);
 static bool prefix_match(const char *text, const char *full);
 static bool prefix_match_least(const char *text, const char *full, size_t length_least);
+static void command_catchpoint(struct control *c, char *const words[], uint32_t count);
+static void help_catchpoint(void);
+static void stop_print_trap(struct process *p, struct stop_reason reason);
+static uint32_t syscalls_parse(const char *text, uint16_t *out, uint32_t count_max);
+static bool syscalls_parse_one(const char *token, size_t length, uint16_t *out);
 
 static void command_help(char *const words[], uint32_t count);
 static void help_all(void);
@@ -75,14 +84,54 @@ static void register_set_one(struct process *p, const char *name, const char *te
 
 static void stop_print(struct process *p, struct stop_reason reason);
 static bool value_parse(const char *text, uint64_t *out);
+
+static volatile sig_atomic_t interrupt_at_prompt = 0;
+static volatile sig_atomic_t interrupt_pid = 0;
+
+static_assert(sizeof(pid_t) <= sizeof(sig_atomic_t),
+              "a pid must survive the round trip through the handler's type");
+static void interrupt_handler(int signal_number) {
+    (void)signal_number;
+
+    const int errno_saved = errno;
+
+    if (interrupt_at_prompt == 0) {
+        if (interrupt_pid > 0) {
+            (void)kill((pid_t)interrupt_pid, SIGSTOP);
+        }
+    }
+
+    errno = errno_saved;
+}
+
+static int interrupt_install(pid_t pid) {
+    assert(pid > 0);
+    assert(interrupt_pid == 0);  // Installed once, at startup, never replaced.
+
+    interrupt_pid = pid;
+
+    struct sigaction action = {
+        .sa_handler = interrupt_handler,
+        .sa_flags = 0,
+    };
+    if (sigemptyset(&action.sa_mask) == -1) {
+        perror("sigemptyset");
+        return -1;
+    }
+    if (sigaction(SIGINT, &action, NULL) == -1) {
+        perror("sigaction");
+        return -1;
+    }
+    return 0;
+}
 int main(int argc, char **argv) {
     assert(argc >= 1);
     assert(argv != NULL);
-
     struct process proc;
     if (target_open(argc, argv, &proc) == -1) return 1;
     assert(proc.state == PROC_STOPPED);
 
+    if (interrupt_install(proc.pid) == -1) return 1;
     struct control ctl;
     control_init(&ctl);
 
@@ -148,19 +197,42 @@ static bool command_read(char *buffer, size_t buffer_size) {
     assert(buffer != NULL);
     assert(buffer_size > 1);
 
-    printf("wraith> ");
-    if (fflush(stdout) == EOF) {
-        perror("fflush");
-        return false;
-    }
-    if (fgets(buffer, (int)buffer_size, stdin) == NULL) {
-        printf("\n");  // Leave the shell prompt on a line of its own.
-        return false;
-    }
-    buffer[strcspn(buffer, "\n")] = '\0';
-    return true;
-}
+    // Bounded (5.6): one interrupt per pass. Someone leaning on ctrl-C is a
+    // broken world, not a slow one.
+    enum { interrupts_max = 64 };
+    for (uint32_t attempt = 0; attempt < interrupts_max; attempt++) {
+        printf("wraith> ");
+        if (fflush(stdout) == EOF) {
+            perror("fflush");
+            return false;
+        }
 
+        // The window in which ctrl-C means the line rather than the tracee.
+        interrupt_at_prompt = 1;
+        errno = 0;
+        char *const line = fgets(buffer, (int)buffer_size, stdin);
+        interrupt_at_prompt = 0;
+
+        if (line != NULL) {
+            buffer[strcspn(buffer, "\n")] = '\0';
+            return true;
+        }
+
+        if (feof(stdin)) {
+            printf("\n");  // Leave the shell prompt on a line of its own.
+            return false;
+        }
+        if (errno != EINTR) {
+            perror("fgets");
+            return false;
+        }
+        printf("\n");
+        clearerr(stdin);
+    }
+
+    fprintf(stderr, "interrupted too many times\n");
+    return false;
+}
 // alphabetical ordejj
 static void command_handle(struct control *c, struct process *p, char *command) {
     assert(c != NULL);
@@ -177,6 +249,10 @@ static void command_handle(struct control *c, struct process *p, char *command) 
 
     if (prefix_match(words[0], "breakpoint")) {
         command_breakpoint(c, p, words, count);
+        return;
+    }
+    if(prefix_match_least(words[0], "catchpoint", 2)) {
+        command_catchpoint(c, words, count);
         return;
     }
     if (prefix_match(words[0], "continue")) {
@@ -238,15 +314,13 @@ static void stop_print(struct process *p, struct stop_reason reason) {
             printf("terminated: %s\n", strsignal(reason.info));
             break;
         case PROC_STOPPED: {
-            // The address matters more than the signal name: it is what you
-            // feed back into breakpoint set and disassemble -a.
             const struct user_regs_struct *const registers = process_registers(p);
             if (registers == NULL) {
                 printf("stopped: %s\n", strsignal(reason.info));
             } else {
-                printf("stopped: %s at 0x%016" PRIx64 "\n", strsignal(reason.info),
-                       (uint64_t)registers->rip);
+                printf("stopped: %s at 0x%016" PRIx64 "\n", strsignal(reason.info), (uint64_t)registers->rip);
             }
+            stop_print_trap(p, reason);
             break;
         }
         // A running process is not a stop reason, and a value outside the enum
@@ -256,8 +330,79 @@ static void stop_print(struct process *p, struct stop_reason reason) {
             break;
     }
 }
+// The second line of a stop, when there is one to say. Kept out of stop_print
+// so that function stays a switch over the lifecycle and nothing else.
+static void stop_print_trap(struct process *p, struct stop_reason reason) {
+    assert(p != NULL);
+    assert(reason.reason == PROC_STOPPED);
 
+    if (reason.trap != PROC_TRAP_SYSCALL) return;
 
+    const struct process_syscall *const syscall = process_syscall(p);
+    if (syscall == NULL) return;
+
+    const char *const name = syscall_name(syscall->number);
+    if (syscall->entry) {
+        printf("  syscall entry %s(%u)", name != NULL ? name : "syscall",
+               syscall->number);
+
+        for (uint32_t i = 0; i < process_syscall_max_arguments; i++) {
+            printf(" 0x%" PRIx64, syscall->arguments[i]);
+        }
+        printf("\n");
+        return;
+    }
+
+    // is_error comes from the kernel rather than from the sign of the return
+    // value, because a negative return is ambiguous: mmap legitimately returns
+    // addresses whose top bit is set.
+    printf("  syscall exit  %s(%u) = %" PRId64 "%s\n", name != NULL ? name : "syscall",
+           syscall->number, syscall->result, syscall->error ? " (error)" : "");
+}
+
+static void command_catchpoint(struct control *c, char *const words[], uint32_t count) {
+    assert(c != NULL);
+    assert(words != NULL);
+    assert(count >= 1);
+
+    if (count < 2) {
+        help_catchpoint();
+        return;
+    }
+
+    if (!prefix_match(words[1], "syscall")) {
+        help_catchpoint();
+        return;
+    }
+
+    if(count == 2) {
+        if(control_catch_syscalls(c, CONTROL_CATCH_ALL, NULL, 0) == -1) return;
+        printf("catching all syscalls\n");
+        return;
+    }
+
+    if(strcmp(words[2], "none") == 0) {
+        if(control_catch_syscalls(c, CONTROL_CATCH_NONE, NULL, 0) == -1) return;
+        printf("catching no syscalls\n");
+        return;
+    }
+
+    uint16_t numbers[control_syscalls_max];
+    const uint32_t parsed = syscalls_parse(words[2], numbers, control_syscalls_max);
+    if(parsed == 0) {
+        fprintf(stderr, "expected syscalls like write, openat or 1,257: %s\n", words[2]);
+        return;
+    }
+
+        if (control_catch_syscalls(c, CONTROL_CATCH_SOME, numbers, parsed) == -1) return;
+
+    printf("catching");
+    for (uint32_t index = 0; index < parsed; index++) {
+        const char *const name = syscall_name(numbers[index]);
+        printf(" %s(%u)", name != NULL ? name : "unknown", numbers[index]);
+    }
+    printf("\n");
+}
 
 static uint32_t command_split(char *command, char *words[], uint32_t words_max) {
     assert (command != NULL);
@@ -341,6 +486,10 @@ static void command_help(char *const words[], uint32_t count) {
         help_all();
         return;
     }
+    if (prefix_match(words[1], "catchpoint")) {
+        help_catchpoint();
+        return;
+    }
     if (prefix_match(words[1], "breakpoint")) {
         help_breakpoint();
         return;
@@ -369,6 +518,7 @@ static void help_all(void) {
     printf("memory       read or write the process's memory\n");
     printf("register     read or write the process's registers\n");
     printf("step         execute exactly one instruction\n");
+    printf("catchpoint   stop on syscalls entering or leaving the kernel\n");
 }
 
 static void help_breakpoint(void) {
@@ -383,6 +533,11 @@ static void help_disassemble(void) {
     printf("disassemble              %d instructions at rip\n", main_disassemble_count_default);
     printf("disassemble -c <count>   count instructions, 1 to %d\n", main_disassemble_count_max);
     printf("disassemble -a <address> start somewhere other than rip\n");
+}
+static void help_catchpoint(void) {
+    printf("catchpoint syscall              every syscall, entry and exit\n");
+    printf("catchpoint syscall none         no syscalls (the default)\n");
+    printf("catchpoint syscall <list>       by name or number: write,openat or 1,257\n");
 }
 
 static void help_memory(void) {
@@ -562,11 +717,83 @@ static void memory_patch(struct control *c, struct process *p, uint64_t address,
     if (control_memory_write(c, p, address, bytes, count) == -1) return;
     printf("wrote %u byte%s at 0x%016" PRIx64 "\n", count, count == 1 ? "" : "s", address);
 }
+// Parses "write,openat" or "1,257" into syscall numbers, returning the count.
+// Returns 0 for anything malformed, which is a safe failure value because a
+// zero-syscall catchpoint is meaningless and so can never be a real answer.
+static uint32_t syscalls_parse(const char *text, uint16_t *out, uint32_t count_max) {
+    assert(text != NULL);
+    assert(out != NULL);
+    assert(count_max > 0);
 
-// Parses "[0xff,0xde,0xad]" into bytes, returning the count. Returns 0 for
-// anything malformed, which is a safe failure value because a zero-byte write
-// is meaningless and so can never be a legitimate answer.
-//
+    const char *cursor = text;
+    uint32_t count = 0;
+
+    // Bounded (5.6): one syscall per pass, so count_max passes is a ceiling no
+    // well-formed input can reach.
+    for (uint32_t pass = 0; pass < count_max; pass++) {
+        const size_t length = strcspn(cursor, ",");
+        if (length == 0) return 0;  // An empty token: "", ",read" or "read,,write".
+
+        uint16_t number = 0;
+        if (!syscalls_parse_one(cursor, length, &number)) return 0;
+
+        out[count] = number;
+        count++;
+        cursor += length;
+
+        if (*cursor == '\0') break;
+        assert(*cursor == ',');  // strcspn stopped, so it stopped on a comma.
+        cursor++;
+    }
+
+    if (*cursor != '\0') return 0;  // More syscalls than count_max.
+
+    assert(count > 0);
+    assert(count <= count_max);
+    return count;
+}
+
+// One token of that list, by name or by number. Named for its caller so the
+// call history reads off the page.
+static bool syscalls_parse_one(const char *token, size_t length, uint16_t *out) {
+    assert(token != NULL);
+    assert(length > 0);
+    assert(out != NULL);
+
+    // strtoul and syscall_number both want a NUL, and a token is a slice of a
+    // longer string, so it is copied before either of them sees it.
+    if (length >= main_syscall_name_bytes_max) return false;
+
+    char name[main_syscall_name_bytes_max];
+    memcpy(name, token, length);
+    name[length] = '\0';
+
+    // A leading digit means a number, anything else means a name. Deciding on
+    // the first character, rather than trying strtoul and falling back on
+    // failure, keeps the two dialects from overlapping: base 0 would otherwise
+    // read a name beginning with a hex digit as a partial number.
+    //
+    // The cast is not decoration: isdigit is undefined for a negative char, and
+    // char is signed on x86-64.
+    if (!isdigit((unsigned char)name[0])) {
+        return syscall_number(name, out);
+    }
+
+    // Base 0, so 1, 0x1 and 01 all work, matching value_parse and bytes_parse
+    // rather than inventing a third numeric dialect for the same debugger.
+    char *end = NULL;
+    errno = 0;
+    const unsigned long value = strtoul(name, &end, 0);
+
+    if (errno != 0) return false;     // Out of range for an unsigned long.
+    if (end == name) return false;    // No digits at all.
+    if (*end != '\0') return false;   // Trailing junk, e.g. "1x".
+    if (value > UINT16_MAX) return false;
+
+    *out = (uint16_t)value;
+    return true;
+}
+
 // Base 0, so [0xff], [255] and [0377] all work, matching value_parse rather
 // than inventing a second numeric dialect for the same debugger.
 static uint32_t bytes_parse(const char *text, uint8_t *out, uint32_t count_max) {
