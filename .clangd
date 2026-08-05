@@ -1,2 +1,2 @@
 CompileFlags:
-  Add: [-I/home/bransonc/projects/wraith/include, -std=gnu11]
+  Add: [-I/home/bransonc/projects/wraith/src, -std=gnu11]
