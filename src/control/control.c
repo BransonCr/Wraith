@@ -4,7 +4,7 @@
 //
 // This layer knows what a breakpoint is. The layer below it knows only bytes
 // and addresses, and this file is the only place that turns one into the other.
-#include <control.h>
+#include <control/control.h>
 
 #include <assert.h>
 #include <inttypes.h>  // PRIx64

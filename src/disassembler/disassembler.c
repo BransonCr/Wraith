@@ -8,7 +8,7 @@
 #include <assert.h>
 #include <string.h>
 
-#include <disassembler.h>
+#include <disassembler/disassembler.h>
 #include <Zydis/Zydis.h>
 
 uint32_t disassembler_decode(const uint8_t *bytes, uint32_t size_bytes, uint64_t address,

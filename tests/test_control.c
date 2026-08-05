@@ -6,8 +6,8 @@
 // logic runs with no tracee at all. The round trips below it need a real
 // process, and take their address from wherever the tracee happens to be
 // stopped rather than hardcoding one, so they survive ASLR and a new libc.
-#include <control.h>
-#include <process.h>
+#include <control/control.h>
+#include <process/process.h>
 
 #include <assert.h>
 #include <stdint.h>

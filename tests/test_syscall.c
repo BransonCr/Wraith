@@ -2,7 +2,7 @@
 // two lookups over it: that a number maps back to its name, that a name maps
 // back to its number, and that neither one walks into the hole in the middle of
 // the numbering.
-#include <syscall.h>
+#include <syscall/syscall.h>
 
 #include <assert.h>
 #include <stdio.h>

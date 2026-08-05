@@ -102,4 +102,16 @@ int64_t process_memory_read(struct process *p, uint64_t address, uint8_t *out, u
 int process_memory_write(struct process *p, uint64_t adress, const uint8_t *source, uint32_t size_bytes);
 const struct process_syscall *process_syscall(struct process *p);
 
+
+
+// Syscall budget: 3 (open, read, close).
+// Allocation: none.
+bool process_auxv(const struct process *p, uint64_t type, uint64_t *out);
+
+// Writes /proc/<pid>/exe. Open that path rather than resolving it: readlink
+// appends " (deleted)" once the binary is unlinked, and the kernel follows the
+// link to the inode the process is really running.
+// Syscall budget: 0.
+// Allocation: none.
+bool process_executable_path(const struct process *p, char *out, uint32_t size_bytes);
 #endif  // closes the #ifndef at the top of the file

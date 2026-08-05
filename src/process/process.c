@@ -6,7 +6,7 @@
 // want the atomic pipe-with-O_CLOEXEC rather than pipe(2) plus two fcntl calls.
 #define _GNU_SOURCE
 
-#include <process.h>
+#include <process/process.h>
 
 #include <string.h>  // Already present, for strerror. memcpy needs it too.
 #include <assert.h>
@@ -290,7 +290,64 @@ const struct user_regs_struct *process_registers(struct process *p) {
         return NULL;
     }
 }
+bool process_executable_path(const struct process *p, char *out, uint32_t size_bytes) {
+    assert(p != NULL);
+    assert(p->pid > 0);
+    assert(out != NULL);
+    assert(size_bytes > 0);
 
+    const int written = snprintf(out, size_bytes, "/proc/%d/exe", p->pid);
+    if (written < 0) return false;
+    if ((uint32_t)written >= size_bytes) return false;
+    return true;
+}
+
+bool process_auxv(const struct process *p, uint64_t type, uint64_t *out) {
+    assert(p != NULL);
+    assert(p->pid > 0);
+    assert(out != NULL);
+
+    char path[64];
+    const int written = snprintf(path, sizeof path, "/proc/%d/auxv", p->pid);
+    assert(written > 0);
+    assert((size_t)written < sizeof path);
+
+    const int descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    if (descriptor == -1) {
+        perror(path);
+        return false;
+    }
+
+    // The vector is 368 bytes on this kernel, so 64 pairs is a ceiling with
+    // room to spare, and reading it whole keeps the scan to one pass.
+    enum { auxv_pairs_max = 64 };
+    uint64_t pairs[auxv_pairs_max * 2] = {0};
+    size_t filled = 0;
+
+    for (uint32_t pass = 0; pass < auxv_pairs_max; pass++) {
+        if (filled == sizeof pairs) break;
+        const ssize_t moved = read(descriptor, (uint8_t *)pairs + filled,
+                                   sizeof pairs - filled);
+        if (moved == 0) break;  // A short read is the normal end of a proc file.
+        if (moved == -1) {
+            if (errno == EINTR) continue;
+            perror("read");
+            break;
+        }
+        filled += (size_t)moved;
+    }
+    if (close(descriptor) == -1) perror("close");
+
+    const uint32_t count = (uint32_t)(filled / (sizeof(uint64_t) * 2));
+    for (uint32_t index = 0; index < count; index++) {
+        assert(index < auxv_pairs_max);
+        if (pairs[index * 2] == AT_NULL) break;
+        if (pairs[index * 2] != type) continue;
+        *out = pairs[index * 2 + 1];
+        return true;
+    }
+    return false;
+}
 //syscall result grabber, system call exit recorder.
 //
 const struct process_syscall *process_syscall(struct process *p) {

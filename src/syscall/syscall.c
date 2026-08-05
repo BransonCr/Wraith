@@ -1,7 +1,7 @@
 // The x86-64 syscall table. Direct-indexed rather than searched: the numbers
 // are dense from 0 to 471 with a handful of holes, so the array is 472 pointers
 // of .rodata and a lookup is one bounds check and one load.
-#include <syscall.h>
+#include <syscall/syscall.h>
 
 #include <assert.h>
 #include <stddef.h>

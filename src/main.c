@@ -19,12 +19,12 @@
 #include <sys/types.h>  // pid_t
 #include <sys/user.h>   // struct user_regs_struct
 
-#include <control.h>
-#include <disassembler.h>
-#include <process.h>
-#include <registers.h>
-#include <syscall.h>
-
+#include <control/control.h>
+#include <disassembler/disassembler.h>
+#include <process/process.h>
+#include <registers/registers.h>
+#include <syscall/syscall.h>
+#include <elf/elf.h>
 enum {
     main_command_length_bytes_max = 256,
 
@@ -43,7 +43,8 @@ enum {
 static int target_open(int argc, char **argv, struct process *out);
 static pid_t pid_parse(const char *text);
 static bool command_read(char *buffer, size_t buffer_size);
-static void command_handle(struct control *c, struct process *p, char *command);
+static void command_handle(struct control *c, struct process *p, const struct elf *elf,
+                           uint64_t load_bias, char *command);
 static uint32_t command_split(char *command, char *words[], uint32_t words_max);
 static bool prefix_match(const char *text, const char *full);
 static bool prefix_match_least(const char *text, const char *full, size_t length_least);
@@ -82,8 +83,16 @@ static void registers_print_all(struct process *p);
 static void register_print_one(struct process *p, const char *name);
 static void register_set_one(struct process *p, const char *name, const char *text);
 
-static void stop_print(struct process *p, struct stop_reason reason);
+static void stop_print(struct process *p, const struct elf *elf, uint64_t load_bias,
+                       struct stop_reason reason);
 static bool value_parse(const char *text, uint64_t *out);
+
+
+static bool symbols_open(struct process *p, struct elf *elf, uint64_t *load_bias_out);
+static void symbol_print_at(const struct elf *elf, uint64_t load_bias, uint64_t address);
+static void command_symbol(const struct elf *elf, uint64_t load_bias, char *const words[],
+                           uint32_t count);
+static void help_symbol(void);
 
 static volatile sig_atomic_t interrupt_at_prompt = 0;
 static volatile sig_atomic_t interrupt_pid = 0;
@@ -124,6 +133,39 @@ static int interrupt_install(pid_t pid) {
     }
     return 0;
 }
+//
+// Maps the tracee's own executable and works out the one constant relating its
+// link-time addresses to the addresses the process is actually running at.
+static bool symbols_open(struct process *p, struct elf *elf, uint64_t *load_bias_out) {
+    assert(p != NULL);
+    assert(elf != NULL);
+    assert(load_bias_out != NULL);
+
+    char path[64];
+    if (!process_executable_path(p, path, sizeof path)) return false;
+    if (elf_open(path, elf) == -1) return false;
+
+    // After the exec, never before. /proc/<pid>/auxv is readable either way,
+    // and before the exec it still describes wraith's own image — so a bias
+    // taken there is wrong, and looks entirely plausible.
+    uint64_t entry_virtual = 0;
+    if (!process_auxv(p, AT_ENTRY, &entry_virtual)) {
+        elf_close(elf);
+        return false;
+    }
+
+    const uint64_t entry_file = elf_entry(elf);
+    if (entry_virtual < entry_file) {
+        fprintf(stderr, "entry 0x%" PRIx64 " is below the file's 0x%" PRIx64 "\n",
+                entry_virtual, entry_file);
+        elf_close(elf);
+        return false;
+    }
+
+    *load_bias_out = entry_virtual - entry_file;
+    return true;
+}
+
 int main(int argc, char **argv) {
     assert(argc >= 1);
     assert(argv != NULL);
@@ -132,8 +174,14 @@ int main(int argc, char **argv) {
     assert(proc.state == PROC_STOPPED);
 
     if (interrupt_install(proc.pid) == -1) return 1;
+
     struct control ctl;
     control_init(&ctl);
+
+    struct elf elf;
+    uint64_t load_bias = 0;
+    const bool symbols = symbols_open(&proc, &elf, &load_bias);
+    if (!symbols) fprintf(stderr, "no symbols: addresses only\n");
 
     printf("process: %d\n", proc.pid);
     const struct user_regs_struct *const registers = process_registers(&proc);
@@ -143,10 +191,11 @@ int main(int argc, char **argv) {
 
     char command[main_command_length_bytes_max];
     while (command_read(command, sizeof command)) {
-        command_handle(&ctl, &proc, command);
-        if (process_gone(&proc)) break;  // Nothing left to debug.
+        command_handle(&ctl, &proc, symbols ? &elf : NULL, load_bias, command);
+        if (process_gone(&proc)) break;
     }
 
+    if (symbols) elf_close(&elf);
     if (process_detach(&proc) == -1) return 1;
     return 0;
 }
@@ -234,7 +283,8 @@ static bool command_read(char *buffer, size_t buffer_size) {
     return false;
 }
 // alphabetical ordejj
-static void command_handle(struct control *c, struct process *p, char *command) {
+static void command_handle(struct control *c, struct process *p, const struct elf *elf,
+                           uint64_t load_bias, char *command) {
     assert(c != NULL);
     assert(p != NULL);
     assert(command != NULL);
@@ -261,7 +311,7 @@ static void command_handle(struct control *c, struct process *p, char *command) 
         // our own 0xCC bytes, and continuing without stepping over it traps at
         // the same address forever.
         if (control_continue(c, p, &reason) == -1) return;
-        stop_print(p, reason);
+        stop_print(p, elf, load_bias, reason);
         return;
     }
     if (prefix_match(words[0], "disassemble")) {
@@ -284,10 +334,20 @@ static void command_handle(struct control *c, struct process *p, char *command) 
         command_register(p, words, count);
         return;
     }
-    if (prefix_match(words[0], "step")) {
+    // "step" and "symbol" share an initial, so both demand two characters: a
+    // bare "s" must not silently pick whichever this dispatch tests first.
+    if (prefix_match_least(words[0], "step", 2)) {
         struct stop_reason reason;
         if (control_step(c, p, &reason) == -1) return;
-        stop_print(p, reason);
+        stop_print(p, elf, load_bias, reason);
+        return;
+    }
+    if (prefix_match_least(words[0], "symbol", 2)) {
+        if (elf == NULL) {
+            fprintf(stderr, "no symbols for this process\n");
+            return;
+        }
+        command_symbol(elf, load_bias, words, count);
         return;
     }
     fprintf(stderr, "unknown command: %s\n", words[0]);
@@ -301,7 +361,8 @@ static void command_handle(struct control *c, struct process *p, char *command) 
 //      -fomit-frame-pointer, which is one reason we never build with it.
 // rax: general purpose, by convention the return value or the syscall number.
 
-static void stop_print(struct process *p, struct stop_reason reason) {
+static void stop_print(struct process *p, const struct elf *elf, uint64_t load_bias,
+                       struct stop_reason reason) {
     assert(p != NULL);
     assert(reason.reason != PROC_RUNNING);
 
@@ -318,7 +379,10 @@ static void stop_print(struct process *p, struct stop_reason reason) {
             if (registers == NULL) {
                 printf("stopped: %s\n", strsignal(reason.info));
             } else {
-                printf("stopped: %s at 0x%016" PRIx64 "\n", strsignal(reason.info), (uint64_t)registers->rip);
+                printf("stopped: %s at 0x%016" PRIx64, strsignal(reason.info),
+                       (uint64_t)registers->rip);
+                symbol_print_at(elf, load_bias, (uint64_t)registers->rip);
+                printf("\n");
             }
             stop_print_trap(p, reason);
             break;
@@ -358,6 +422,80 @@ static void stop_print_trap(struct process *p, struct stop_reason reason) {
     // addresses whose top bit is set.
     printf("  syscall exit  %s(%u) = %" PRId64 "%s\n", name != NULL ? name : "syscall",
            syscall->number, syscall->result, syscall->error ? " (error)" : "");
+}
+
+// Appends the function an address falls inside, when there is one. Silence is
+// the honest answer for a stripped binary, or for an address in the loader.
+static void symbol_print_at(const struct elf *elf, uint64_t load_bias, uint64_t address) {
+    if (elf == NULL) return;
+    assert(elf->size_bytes > 0);
+
+    uint64_t address_file = 0;
+    if (!elf_address_file(elf, load_bias, address, &address_file)) return;
+
+    const Elf64_Sym *const symbol = elf_symbol_containing(elf, address_file);
+    if (symbol == NULL) return;
+    if (ELF64_ST_TYPE(symbol->st_info) != STT_FUNC) return;
+
+    const char *const name = elf_symbol_name(elf, symbol);
+    if (name == NULL) return;
+
+    assert(address_file >= symbol->st_value);
+    const uint64_t offset = address_file - symbol->st_value;
+    if (offset == 0) {
+        printf(" (%s)", name);
+    } else {
+        printf(" (%s+%" PRIu64 ")", name, offset);
+    }
+}
+
+// symbol <name>        where a name lives at runtime
+// symbol -a <address>  what lives at an address
+static void command_symbol(const struct elf *elf, uint64_t load_bias, char *const words[],
+                           uint32_t count) {
+    assert(elf != NULL);
+    assert(words != NULL);
+    assert(count >= 1);
+
+    if (count == 3) {
+        if (strcmp(words[1], "-a") == 0) {
+            uint64_t address = 0;
+            if (!value_parse(words[2], &address)) {
+                fprintf(stderr, "not an address: %s\n", words[2]);
+                return;
+            }
+            printf("0x%016" PRIx64, address);
+            symbol_print_at(elf, load_bias, address);
+            printf("\n");
+            return;
+        }
+    }
+
+    if (count == 2) {
+        const Elf64_Sym *const symbol = elf_symbol_by_name(elf, words[1]);
+        if (symbol == NULL) {
+            fprintf(stderr, "no symbol named %s\n", words[1]);
+            return;
+        }
+
+        // A symbol in no section has no runtime address: an undefined import
+        // carries st_value 0, which would otherwise print as the load bias.
+        uint64_t address = 0;
+        if (!elf_address_virtual(elf, load_bias, symbol->st_value, &address)) {
+            fprintf(stderr, "%s has no runtime address\n", words[1]);
+            return;
+        }
+        printf("%-16s 0x%016" PRIx64 "  %" PRIu64 " bytes\n", words[1], address,
+               symbol->st_size);
+        return;
+    }
+
+    help_symbol();
+}
+
+static void help_symbol(void) {
+    printf("symbol <name>        the runtime address of a name\n");
+    printf("symbol -a <address>  the function containing an address\n");
 }
 
 static void command_catchpoint(struct control *c, char *const words[], uint32_t count) {
@@ -506,6 +644,12 @@ static void command_help(char *const words[], uint32_t count) {
         help_register();
         return;
     }
+    // Same two-character floor as the dispatch, for the same reason: "help s"
+    // must not resolve to whichever of step and symbol is tested first.
+    if (prefix_match_least(words[1], "symbol", 2)) {
+        help_symbol();
+        return;
+    }
     fprintf(stderr, "no help available on that\n");
 }
 
@@ -518,6 +662,7 @@ static void help_all(void) {
     printf("memory       read or write the process's memory\n");
     printf("register     read or write the process's registers\n");
     printf("step         execute exactly one instruction\n");
+    printf("symbol       look a name or an address up in the symbol table\n");
     printf("catchpoint   stop on syscalls entering or leaving the kernel\n");
 }
 
