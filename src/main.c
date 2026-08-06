@@ -243,10 +243,6 @@ static int target_open(int argc, char **argv, struct process *out) {
     return -1;
 }
 
-// Parses a decimal pid, returning 0 for anything that is not one. 0 is a safe
-// failure value because it is never a process we could trace, and strtol alone
-// is not enough: it reports "banana" as 0 through the return value, which is
-// indistinguishable from success without checking where it stopped.
 static pid_t pid_parse(const char *text) {
     assert(text != NULL);
 
@@ -420,8 +416,6 @@ static void stop_print(struct process *p, const struct elf *elf, uint64_t load_b
             break;
     }
 }
-// The second line of a stop, when there is one to say. Kept out of stop_print
-// so that function stays a switch over the lifecycle and nothing else.
 static void stop_print_trap(struct process *p, struct stop_reason reason) {
     assert(p != NULL);
     assert(reason.reason == PROC_STOPPED);
@@ -443,15 +437,10 @@ static void stop_print_trap(struct process *p, struct stop_reason reason) {
         return;
     }
 
-    // is_error comes from the kernel rather than from the sign of the return
-    // value, because a negative return is ambiguous: mmap legitimately returns
-    // addresses whose top bit is set.
     printf("  syscall exit  %s(%u) = %" PRId64 "%s\n", name != NULL ? name : "syscall",
            syscall->number, syscall->result, syscall->error ? " (error)" : "");
 }
 
-// Appends the function an address falls inside, when there is one. Silence is
-// the honest answer for a stripped binary, or for an address in the loader.
 static void symbol_print_at(const struct elf *elf, uint64_t load_bias, uint64_t address) {
     if (elf == NULL) return;
     assert(elf->size_bytes > 0);
@@ -681,11 +670,6 @@ static bool prefix_match(const char *text, const char *full) {
 }
 
 //
-// Prefix matching with a floor, for subcommands that share a first letter.
-// "disable" and "delete" both start with "d", and a plain prefix match would
-// hand "d" to whichever the dispatch happens to test first — silently deleting
-// a breakpoint the user meant to keep. Three characters disambiguates them, so
-// both demand three and a bare "d" falls through to the usage line.
 static bool prefix_match_least(const char *text, const char *full, size_t length_least) {
     assert(text != NULL);
     assert(full != NULL);
@@ -979,34 +963,21 @@ static uint32_t syscalls_parse(const char *text, uint16_t *out, uint32_t count_m
     return count;
 }
 
-// One token of that list, by name or by number. Named for its caller so the
-// call history reads off the page.
 static bool syscalls_parse_one(const char *token, size_t length, uint16_t *out) {
     assert(token != NULL);
     assert(length > 0);
     assert(out != NULL);
 
-    // strtoul and syscall_number both want a NUL, and a token is a slice of a
-    // longer string, so it is copied before either of them sees it.
     if (length >= main_syscall_name_bytes_max) return false;
 
     char name[main_syscall_name_bytes_max];
     memcpy(name, token, length);
     name[length] = '\0';
 
-    // A leading digit means a number, anything else means a name. Deciding on
-    // the first character, rather than trying strtoul and falling back on
-    // failure, keeps the two dialects from overlapping: base 0 would otherwise
-    // read a name beginning with a hex digit as a partial number.
-    //
-    // The cast is not decoration: isdigit is undefined for a negative char, and
-    // char is signed on x86-64.
     if (!isdigit((unsigned char)name[0])) {
         return syscall_number(name, out);
     }
 
-    // Base 0, so 1, 0x1 and 01 all work, matching value_parse and bytes_parse
-    // rather than inventing a third numeric dialect for the same debugger.
     char *end = NULL;
     errno = 0;
     const unsigned long value = strtoul(name, &end, 0);
@@ -1032,8 +1003,6 @@ static uint32_t bytes_parse(const char *text, uint8_t *out, uint32_t count_max) 
     const char *cursor = text + 1;
     uint32_t count = 0;
 
-    // Bounded (5.6): one byte per pass, so count_max passes is a ceiling no
-    // well-formed input can reach.
     for (uint32_t pass = 0; pass < count_max; pass++) {
         char *end = NULL;
         errno = 0;
@@ -1133,15 +1102,10 @@ static void disassembly_print(const struct control *c, struct process *p, uint64
 
     // 15 bytes per instruction is the architectural maximum, so this is the
     // smallest request that cannot run out of input before the decoder has
-    // produced the instructions asked for. It over-reads most of the time, and
-    // that costs nothing: it is one syscall either way.
+    // produced the instructions asked for
     uint8_t bytes[main_disassemble_count_max * disassembler_instruction_size_bytes_max];
     const uint32_t size_bytes = instructions_count * disassembler_instruction_size_bytes_max;
 
-    // The single most important call in this file. control_memory_read paints
-    // saved original bytes back over every armed breakpoint; process_memory_read
-    // does not. Read raw and every breakpoint in range decodes as int3, which is
-    // wraith's byte, not the program's.
     const int64_t moved = control_memory_read(c, p, address, bytes, size_bytes);
     if (moved <= 0) {
         fprintf(stderr, "could not read code at 0x%016" PRIx64 "\n", address);
@@ -1230,9 +1194,6 @@ static void register_set_one(struct process *p, const char *name, const char *te
     printf("%-7s 0x%016" PRIx64 "\n", info->name, value);
 }
 
-// Base 0, so 0x1f, 037 and 31 all work the way the user expects from gdb.
-// A typo must not silently become 0 and get written to rip, so every failure
-// mode strtoull has is checked rather than folded into the return value.
 static bool value_parse(const char *text, uint64_t *out) {
     assert(text != NULL);
     assert(out != NULL);

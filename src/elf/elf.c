@@ -31,12 +31,9 @@ int elf_open(const char *path, struct elf *e) {
         return -1;
     }
 
-    // One helper covers everything between the open and the close, so this
-    // function has one acquisition and one release and no path skips either.
     const int result = elf_map(descriptor, path, e);
 
-    // The mapping holds its own reference to the file, so the descriptor has
-    // done its whole job the moment mmap returns.
+
     if (close(descriptor) == -1) perror("close");
     return result;
 }
@@ -243,8 +240,7 @@ static int elf_parse_sections(struct elf *e, const char *path) {
         fprintf(stderr, "%s: section headers are %u bytes\n", path, header->e_shentsize);
         return -1;
     }
-    // The cast below is only defined on an aligned address. Every linker on
-    // this machine emits an aligned e_shoff; the spec does not promise it.
+
     if (header->e_shoff % _Alignof(Elf64_Shdr) != 0) {
         fprintf(stderr, "%s: section header table is misaligned\n", path);
         return -1;
@@ -259,9 +255,7 @@ static int elf_parse_sections(struct elf *e, const char *path) {
     }
 
     const Elf64_Shdr *const sections = (const Elf64_Shdr *)(e->data + header->e_shoff);
-
-    // A file with 0xff00 or more sections cannot say so in a 16-bit field, so
-    // it writes 0 there and keeps the real numbers in section 0.
+.
     uint32_t count = header->e_shnum;
     if (count == 0) count = (uint32_t)sections[0].sh_size;
 
@@ -279,9 +273,7 @@ static int elf_parse_sections(struct elf *e, const char *path) {
     return 0;
 }
 
-// Finds the symbol table by type, not by name: the name is itself just a string
-// in a table the object is free to omit. A stripped binary has no symbols at
-// all, which is not an error — it debugs, it simply cannot name anything.
+
 static void elf_parse_symbols(struct elf *e) {
     assert(e != NULL);
     assert(e->sections_count == 0 || e->sections != NULL);
@@ -306,8 +298,6 @@ static void elf_parse_symbols(struct elf *e) {
     }
 }
 
-// Which section covers a file address. SHF_ALLOC is the filter: a section that
-// is never loaded has sh_addr 0 and would otherwise claim every low address.
 static const Elf64_Shdr *elf_section_containing(const struct elf *e, uint64_t address_file) {
     assert(e != NULL);
     assert(e->sections_count == 0 || e->sections != NULL);
@@ -322,8 +312,7 @@ static const Elf64_Shdr *elf_section_containing(const struct elf *e, uint64_t ad
     return NULL;
 }
 
-// A string table is a run of NUL-terminated strings addressed by byte offset,
-// so offset 0 is the empty string by construction. The bound is the table.
+
 static const char *elf_string(const struct elf *e, const Elf64_Shdr *table, uint32_t offset) {
     assert(e != NULL);
     assert(table != NULL);
@@ -334,8 +323,6 @@ static const char *elf_string(const struct elf *e, const Elf64_Shdr *table, uint
 
     const char *const strings = (const char *)(e->data + table->sh_offset);
 
-    // The table's last byte must be a NUL or a name could run off the mapping.
-    // One load here is what makes the result safe to hand to strcmp and printf.
     if (strings[table->sh_size - 1] != '\0') return NULL;
     return strings + offset;
 }

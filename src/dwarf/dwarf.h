@@ -8,11 +8,6 @@
 #include "arena/arena.h"
 #include "elf/elf.h"
 
-// The spec and every tool spell these DW_TAG_, DW_AT_ and DW_FORM_. Here the
-// prefix follows the layer, per CLAUDE.md, which owns naming outright. The
-// system <dwarf.h> defines all nine hundred of them and ships with elfutils,
-// which CLAUDE.md bans by name; these are the forty this chapter needs.
-
 enum dwarf_tag {
     dwarf_tag_compile_unit = 0x11,
     dwarf_tag_subprogram = 0x2e,

@@ -23,10 +23,6 @@ enum {
     // One .debug_aranges tuple is two addresses.
     dwarf_arange_bytes = 16,
 
-    // The abbreviation table is scratch: decoded per unit, consumed inside one
-    // call, never stored. A static pool per CLAUDE.md rule 8 rather than an
-    // arena, because arenas cannot hand memory back. Valid only for the
-    // duration of one unit walk, which is safe because rule 7 is single-threaded.
     dwarf_abbrevs_max = 2048,
     dwarf_abbrev_attributes_max = 16384,
 

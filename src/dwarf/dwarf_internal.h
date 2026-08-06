@@ -5,9 +5,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// Assertions stay on in every wraith build. These readers run once per byte of
-// .debug_info, so PERFORMANCE.md 11.8 exempts them alone -- keyed on a macro of
-// our own rather than NDEBUG, so nothing else goes quiet along with them.
 #ifdef WRAITH_HOT_ASSERTS_OFF
 #define dwarf_assert_hot(condition) ((void)0)
 #else
@@ -51,8 +48,6 @@ static inline uint64_t dwarf_cursor_fixed(struct dwarf_cursor *c, uint32_t width
     return value;
 }
 
-// Ten bytes is every bit a uint64_t has at seven bits of payload each, so an
-// eleventh byte is malformed rather than merely large. PERFORMANCE.md 5.6.
 enum { dwarf_leb128_bytes_max = 10 };
 
 static inline uint64_t dwarf_cursor_uleb128(struct dwarf_cursor *c) {
@@ -96,8 +91,7 @@ static inline int64_t dwarf_cursor_sleb128(struct dwarf_cursor *c) {
     return 0;
 }
 
-// The terminator must be inside the section: a string relying on the byte after
-// it is a read past the end of the mapping.
+
 static inline const char *dwarf_cursor_string(struct dwarf_cursor *c) {
     dwarf_assert_hot(c != NULL);
     dwarf_assert_hot(c->offset <= c->size_bytes);
