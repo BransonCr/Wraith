@@ -25,8 +25,13 @@
 #include <registers/registers.h>
 #include <syscall/syscall.h>
 #include <elf/elf.h>
+#include <dwarf/dwarf.h>
+#include <arena/arena.h>
+
+
 enum {
     main_command_length_bytes_max = 256,
+    main_dwarf_arena_bytes = 256u * 1024u * 1024u,  // 256 MiB.
 
     main_syscall_name_bytes_max = 32,
     main_words_max = 8,
@@ -44,7 +49,10 @@ static int target_open(int argc, char **argv, struct process *out);
 static pid_t pid_parse(const char *text);
 static bool command_read(char *buffer, size_t buffer_size);
 static void command_handle(struct control *c, struct process *p, const struct elf *elf,
-                           uint64_t load_bias, char *command);
+                           struct dwarf *dwarf, uint64_t load_bias, char *command);
+static void command_function(const struct elf *elf, struct dwarf *dwarf, uint64_t load_bias,
+                             char *const words[], uint32_t count);
+static void help_function(void);
 static uint32_t command_split(char *command, char *words[], uint32_t words_max);
 static bool prefix_match(const char *text, const char *full);
 static bool prefix_match_least(const char *text, const char *full, size_t length_least);
@@ -183,6 +191,18 @@ int main(int argc, char **argv) {
     const bool symbols = symbols_open(&proc, &elf, &load_bias);
     if (!symbols) fprintf(stderr, "no symbols: addresses only\n");
 
+    // The arena outlives every dwarf query, so it is created here and passed
+    // down. dwarf never owns it: the caller decides the lifetime and the ceiling.
+    struct arena dwarf_arena = {0};
+    struct dwarf dwarf = {0};
+    bool debug_info = false;
+    if (symbols) {
+        if (arena_init(&dwarf_arena, main_dwarf_arena_bytes) == 0) {
+            if (dwarf_open(&dwarf, &elf, &dwarf_arena) == 0) debug_info = dwarf_has_info(&dwarf);
+        }
+        if (!debug_info) fprintf(stderr, "no debug info: build with -g for `function`\n");
+    }
+
     printf("process: %d\n", proc.pid);
     const struct user_regs_struct *const registers = process_registers(&proc);
     if (registers != NULL) {
@@ -191,10 +211,12 @@ int main(int argc, char **argv) {
 
     char command[main_command_length_bytes_max];
     while (command_read(command, sizeof command)) {
-        command_handle(&ctl, &proc, symbols ? &elf : NULL, load_bias, command);
+        command_handle(&ctl, &proc, symbols ? &elf : NULL, debug_info ? &dwarf : NULL,
+                       load_bias, command);
         if (process_gone(&proc)) break;
     }
 
+    arena_deinit(&dwarf_arena);
     if (symbols) elf_close(&elf);
     if (process_detach(&proc) == -1) return 1;
     return 0;
@@ -284,7 +306,7 @@ static bool command_read(char *buffer, size_t buffer_size) {
 }
 // alphabetical ordejj
 static void command_handle(struct control *c, struct process *p, const struct elf *elf,
-                           uint64_t load_bias, char *command) {
+                           struct dwarf *dwarf, uint64_t load_bias, char *command){
     assert(c != NULL);
     assert(p != NULL);
     assert(command != NULL);
@@ -307,9 +329,6 @@ static void command_handle(struct control *c, struct process *p, const struct el
     }
     if (prefix_match(words[0], "continue")) {
         struct stop_reason reason;
-        // control_continue, not process_resume: rip may be sitting on one of
-        // our own 0xCC bytes, and continuing without stepping over it traps at
-        // the same address forever.
         if (control_continue(c, p, &reason) == -1) return;
         stop_print(p, elf, load_bias, reason);
         return;
@@ -334,8 +353,6 @@ static void command_handle(struct control *c, struct process *p, const struct el
         command_register(p, words, count);
         return;
     }
-    // "step" and "symbol" share an initial, so both demand two characters: a
-    // bare "s" must not silently pick whichever this dispatch tests first.
     if (prefix_match_least(words[0], "step", 2)) {
         struct stop_reason reason;
         if (control_step(c, p, &reason) == -1) return;
@@ -348,6 +365,15 @@ static void command_handle(struct control *c, struct process *p, const struct el
             return;
         }
         command_symbol(elf, load_bias, words, count);
+        return;
+    }
+    if (prefix_match_least(words[0], "function", 2)) {
+        if(dwarf == NULL) {
+            fprintf(stderr, "no debug info for this process\n");
+            return;
+        }
+        assert(elf != NULL);
+        command_function(elf, dwarf, load_bias, words, count);
         return;
     }
     fprintf(stderr, "unknown command: %s\n", words[0]);
@@ -496,6 +522,59 @@ static void command_symbol(const struct elf *elf, uint64_t load_bias, char *cons
 static void help_symbol(void) {
     printf("symbol <name>        the runtime address of a name\n");
     printf("symbol -a <address>  the function containing an address\n");
+}
+
+static void command_function(const struct elf *elf, struct dwarf *dwarf, uint64_t load_bias,
+                             char *const words[], uint32_t count) {
+    assert(elf != NULL);
+    assert(dwarf != NULL);
+    assert(words != NULL);
+    assert(count >= 1);
+
+    struct dwarf_function_info info = {0};
+
+    if (count == 3) {
+        if (strcmp(words[1], "-a") == 0) {
+            uint64_t address_virtual = 0;
+            if (!value_parse(words[2], &address_virtual)) {
+                fprintf(stderr, "not an address: %s\n", words[2]);
+                return;
+            }
+            // The tracee's addresses and the file's differ by the load bias, and
+            // an address in no section of this file belongs to no function of it.
+            uint64_t address_file = 0;
+            if (!elf_address_file(elf, load_bias, address_virtual, &address_file)) {
+                fprintf(stderr, "0x%016" PRIx64 " is not in this file\n", address_virtual);
+                return;
+            }
+            if (!dwarf_function_containing(dwarf, address_file, &info)) {
+                fprintf(stderr, "no function at 0x%016" PRIx64 "\n", address_virtual);
+                return;
+            }
+            printf("%s+%" PRIu64 "  [0x%016" PRIx64 ", 0x%016" PRIx64 ")\n",
+                   info.name != NULL ? info.name : "(anonymous)",
+                   address_file - info.low_pc, info.low_pc + load_bias,
+                   info.high_pc + load_bias);
+            return;
+        }
+    }
+
+    if (count == 2) {
+        if (!dwarf_function_by_name(dwarf, words[1], &info)) {
+            fprintf(stderr, "no function named %s\n", words[1]);
+            return;
+        }
+        printf("%-16s 0x%016" PRIx64 "  %" PRIu64 " bytes\n", words[1],
+               info.low_pc + load_bias, info.high_pc - info.low_pc);
+        return;
+    }
+
+    help_function();
+}
+
+static void help_function(void) {
+    printf("function <name>        the address of a function, from DWARF\n");
+    printf("function -a <address>  the function containing an address, from DWARF\n");
 }
 
 static void command_catchpoint(struct control *c, char *const words[], uint32_t count) {
@@ -664,6 +743,8 @@ static void help_all(void) {
     printf("step         execute exactly one instruction\n");
     printf("symbol       look a name or an address up in the symbol table\n");
     printf("catchpoint   stop on syscalls entering or leaving the kernel\n");
+    printf("function <name>        the address of a function, from DWARF\n");
+    printf("function -a <address>  the function containing an address, from DWARF\n");
 }
 
 static void help_breakpoint(void) {

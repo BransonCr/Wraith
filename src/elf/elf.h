@@ -5,11 +5,8 @@
 #include <elf.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdbool.h>
 
-// Two kinds of address meet here and must never be mixed. A file address is
-// what the linker wrote into the object; a virtual address is where that byte
-// sits in the running process. They differ by one constant for the whole file,
-// the load bias, which the caller supplies because only process can learn it.
 //
 // Nothing is copied out of the file. Every pointer aims into the mapping, so a
 // binary with a megabyte of symbols costs one mmap and the pages actually read.
@@ -32,7 +29,8 @@ void elf_close(struct elf *e);
 
 uint64_t elf_entry(const struct elf *e);
 const char *elf_section_name(const struct elf *e, uint32_t index);
-
+bool elf_section_bytes(const struct elf *e, const char *name,
+                       const uint8_t **data_out, uint64_t *size_bytes_out);
 // Guarded by the section table on purpose: an address on the stack belongs to
 // no section of this file, and shifting it by the bias would otherwise produce
 // a file address that can land inside a  symbol by coincidence.

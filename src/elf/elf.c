@@ -69,7 +69,33 @@ const char *elf_section_name(const struct elf *e, uint32_t index) {
     if (e->section_strings == NULL) return NULL;
     return elf_string(e, e->section_strings, e->sections[index].sh_name);
 }
+bool elf_section_bytes(const struct elf *e, const char *name,
+                        const uint8_t **data_out, uint64_t *size_bytes_out) {
+    assert(e != NULL);
+    assert(name != NULL);
+    assert(data_out != NULL);
+    assert(size_bytes_out != NULL);
 
+    *data_out = NULL;
+    *size_bytes_out = 0;
+
+    for (uint32_t i = 0; i < e->sections_count; i++) {
+        const Elf64_Shdr *const section = &e->sections[i];
+        if (section->sh_type == SHT_NOBITS) continue;
+
+        const char *const found = elf_section_name(e, i);
+        if (found == NULL) continue;
+        if (strcmp(found, name) != 0) continue;
+
+        if (section->sh_offset > e->size_bytes) return false;
+        if (section->sh_size > e->size_bytes - section->sh_offset) return false;
+
+        *data_out = e->data + section->sh_offset;
+        *size_bytes_out = section->sh_size;
+        return true;
+    }
+    return false;
+}
 bool elf_address_file(const struct elf *e, uint64_t load_bias,
                       uint64_t address_virtual, uint64_t *out) {
     assert(e != NULL);
