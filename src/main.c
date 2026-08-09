@@ -43,6 +43,8 @@ enum {
 
     main_disassemble_count_max = 64,
     main_disassemble_count_default = 5,
+
+    main_line_addresses_max = 16,
 };
 
 static int target_open(int argc, char **argv, struct process *out);
@@ -53,6 +55,14 @@ static void command_handle(struct control *c, struct process *p, const struct el
 static void command_function(const struct elf *elf, struct dwarf *dwarf, uint64_t load_bias,
                              char *const words[], uint32_t count);
 static void help_function(void);
+static void command_line(struct process *p, const struct elf *elf, struct dwarf *dwarf,
+                         uint64_t load_bias, char *const words[], uint32_t count);
+static void line_print_at(const struct elf *elf, struct dwarf *dwarf, uint64_t load_bias,
+                          uint64_t address_virtual);
+static void source_print_at(const struct elf *elf, struct dwarf *dwarf, uint64_t load_bias,
+                            uint64_t address_virtual);
+static bool location_split(char *text, uint32_t *line_out);
+static void help_line(void);
 static uint32_t command_split(char *command, char *words[], uint32_t words_max);
 static bool prefix_match(const char *text, const char *full);
 static bool prefix_match_least(const char *text, const char *full, size_t length_least);
@@ -91,8 +101,8 @@ static void registers_print_all(struct process *p);
 static void register_print_one(struct process *p, const char *name);
 static void register_set_one(struct process *p, const char *name, const char *text);
 
-static void stop_print(struct process *p, const struct elf *elf, uint64_t load_bias,
-                       struct stop_reason reason);
+static void stop_print(struct process *p, const struct elf *elf, struct dwarf *dwarf,
+                       uint64_t load_bias, struct stop_reason reason);
 static bool value_parse(const char *text, uint64_t *out);
 
 
@@ -330,7 +340,7 @@ static void command_handle(struct control *c, struct process *p, const struct el
     if (prefix_match(words[0], "continue")) {
         struct stop_reason reason;
         if (control_continue(c, p, &reason) == -1) return;
-        stop_print(p, elf, load_bias, reason);
+        stop_print(p, elf, dwarf, load_bias, reason);
         return;
     }
     if (prefix_match(words[0], "disassemble")) {
@@ -353,10 +363,19 @@ static void command_handle(struct control *c, struct process *p, const struct el
         command_register(p, words, count);
         return;
     }
+    if (prefix_match(words[0], "line")) {
+        if (dwarf == NULL) {
+            fprintf(stderr, "no debug info for this process\n");
+            return;
+        }
+        assert(elf != NULL);
+        command_line(p, elf, dwarf, load_bias, words, count);
+        return;
+    }
     if (prefix_match_least(words[0], "step", 2)) {
         struct stop_reason reason;
         if (control_step(c, p, &reason) == -1) return;
-        stop_print(p, elf, load_bias, reason);
+        stop_print(p, elf, dwarf, load_bias, reason);
         return;
     }
     if (prefix_match_least(words[0], "symbol", 2)) {
@@ -387,8 +406,8 @@ static void command_handle(struct control *c, struct process *p, const struct el
 //      -fomit-frame-pointer, which is one reason we never build with it.
 // rax: general purpose, by convention the return value or the syscall number.
 
-static void stop_print(struct process *p, const struct elf *elf, uint64_t load_bias,
-                       struct stop_reason reason) {
+static void stop_print(struct process *p, const struct elf *elf, struct dwarf *dwarf,
+                       uint64_t load_bias, struct stop_reason reason) {
     assert(p != NULL);
     assert(reason.reason != PROC_RUNNING);
 
@@ -409,6 +428,7 @@ static void stop_print(struct process *p, const struct elf *elf, uint64_t load_b
                        (uint64_t)registers->rip);
                 symbol_print_at(elf, load_bias, (uint64_t)registers->rip);
                 printf("\n");
+                source_print_at(elf, dwarf, load_bias, (uint64_t)registers->rip);
             }
             stop_print_trap(p, reason);
             break;
@@ -577,6 +597,123 @@ static void help_function(void) {
     printf("function -a <address>  the function containing an address, from DWARF\n");
 }
 
+// line                the source line at rip
+// line -a <address>   the source line at an address
+// line <file>:<n>     the addresses a source line compiles to
+static void command_line(struct process *p, const struct elf *elf, struct dwarf *dwarf,
+                         uint64_t load_bias, char *const words[], uint32_t count) {
+    assert(p != NULL);
+    assert(elf != NULL);
+    assert(dwarf != NULL);
+    assert(count >= 1);
+
+    if (count == 1) {
+        const struct user_regs_struct *const registers = process_registers(p);
+        if (registers == NULL) return;
+        line_print_at(elf, dwarf, load_bias, (uint64_t)registers->rip);
+        return;
+    }
+
+    if (count == 3) {
+        if (strcmp(words[1], "-a") == 0) {
+            uint64_t address = 0;
+            if (!value_parse(words[2], &address)) {
+                fprintf(stderr, "not an address: %s\n", words[2]);
+                return;
+            }
+            line_print_at(elf, dwarf, load_bias, address);
+            return;
+        }
+    }
+
+    if (count == 2) {
+        uint32_t line = 0;
+        if (!location_split(words[1], &line)) {
+            fprintf(stderr, "expected <file>:<line>, got: %s\n", words[1]);
+            return;
+        }
+
+        uint64_t addresses[main_line_addresses_max];
+        const uint32_t found = dwarf_line_addresses(dwarf, words[1], line, addresses,
+                                                    main_line_addresses_max);
+        if (found == 0) {
+            fprintf(stderr, "no code at %s:%" PRIu32 "\n", words[1], line);
+            return;
+        }
+        for (uint32_t index = 0; index < found; index++) {
+            printf("0x%016" PRIx64 "\n", addresses[index] + load_bias);
+        }
+        return;
+    }
+
+    help_line();
+}
+
+static void line_print_at(const struct elf *elf, struct dwarf *dwarf, uint64_t load_bias,
+                          uint64_t address_virtual) {
+    assert(elf != NULL);
+    assert(dwarf != NULL);
+
+    uint64_t address_file = 0;
+    if (!elf_address_file(elf, load_bias, address_virtual, &address_file)) {
+        fprintf(stderr, "0x%016" PRIx64 " is not in this file\n", address_virtual);
+        return;
+    }
+
+    struct dwarf_line_info info = {0};
+    if (!dwarf_line_at_address(dwarf, address_file, &info)) {
+        fprintf(stderr, "no source line at 0x%016" PRIx64 "\n", address_virtual);
+        return;
+    }
+
+    printf("%s:%" PRIu32 "  starts at 0x%016" PRIx64,
+           info.file != NULL ? info.file : "(unknown)", info.line,
+           info.address + load_bias);
+    if (info.directory != NULL) printf("  in %s", info.directory);
+    printf("\n");
+}
+
+// The second line of a stop, when the address maps to source. Silence is honest.
+static void source_print_at(const struct elf *elf, struct dwarf *dwarf, uint64_t load_bias,
+                            uint64_t address_virtual) {
+    if (elf == NULL) return;
+    if (dwarf == NULL) return;
+
+    uint64_t address_file = 0;
+    if (!elf_address_file(elf, load_bias, address_virtual, &address_file)) return;
+
+    struct dwarf_line_info info = {0};
+    if (!dwarf_line_at_address(dwarf, address_file, &info)) return;
+    if (info.file == NULL) return;
+
+    printf("  at %s:%" PRIu32 "\n", info.file, info.line);
+}
+
+// Splits on the last colon, so a path that contains one still parses. Mutates text.
+static bool location_split(char *text, uint32_t *line_out) {
+    assert(text != NULL);
+    assert(line_out != NULL);
+
+    char *const colon = strrchr(text, ':');
+    if (colon == NULL) return false;
+    if (colon == text) return false;
+
+    uint64_t value = 0;
+    if (!value_parse(colon + 1, &value)) return false;
+    if (value == 0) return false;
+    if (value > UINT32_MAX) return false;
+
+    *colon = '\0';
+    *line_out = (uint32_t)value;
+    return true;
+}
+
+static void help_line(void) {
+    printf("line                 the source line at rip\n");
+    printf("line -a <address>    the source line at an address\n");
+    printf("line <file>:<n>      the addresses a source line compiles to\n");
+}
+
 static void command_catchpoint(struct control *c, char *const words[], uint32_t count) {
     assert(c != NULL);
     assert(words != NULL);
@@ -715,6 +852,10 @@ static void command_help(char *const words[], uint32_t count) {
         help_disassemble();
         return;
     }
+    if (prefix_match(words[1], "line")) {
+        help_line();
+        return;
+    }
     if (prefix_match(words[1], "memory")) {
         help_memory();
         return;
@@ -738,6 +879,7 @@ static void help_all(void) {
     printf("disassemble  decode machine code into assembly\n");
     printf("exit         detach and leave\n");
     printf("help         this list, or help <command>\n");
+    printf("line         map an address to a source line, or back\n");
     printf("memory       read or write the process's memory\n");
     printf("register     read or write the process's registers\n");
     printf("step         execute exactly one instruction\n");

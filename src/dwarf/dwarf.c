@@ -72,9 +72,12 @@ struct dwarf_abbrev_table {
 struct dwarf_die_values {
     uint64_t low_pc;
     uint64_t high_pc_raw;
+    uint64_t stmt_list;
     dwarf_strid name;
+    dwarf_strid comp_dir;
     bool has_low_pc;
     bool has_high_pc;
+    bool has_stmt_list;
     bool high_pc_is_length;
 };
 
@@ -86,7 +89,7 @@ static const uint8_t dwarf_form_width[] = {
     [dwarf_form_data1] = 1,     [dwarf_form_flag] = 1,      [dwarf_form_strp] = 4,
     [dwarf_form_ref_addr] = 4,  [dwarf_form_ref1] = 1,      [dwarf_form_ref2] = 2,
     [dwarf_form_ref4] = 4,      [dwarf_form_ref8] = 8,      [dwarf_form_sec_offset] = 4,
-    [dwarf_form_ref_sup4] = 4,  [dwarf_form_strp_sup] = 4,  [dwarf_form_data16] = 16,
+    [dwarf_form_ref_sup4] = 4,  [dwarf_form_strp_sup] = 4,
     [dwarf_form_line_strp] = 4, [dwarf_form_ref_sig8] = 8,  [dwarf_form_ref_sup8] = 8,
     [dwarf_form_strx1] = 1,     [dwarf_form_strx2] = 2,     [dwarf_form_strx3] = 3,
     [dwarf_form_strx4] = 4,     [dwarf_form_addrx1] = 1,    [dwarf_form_addrx2] = 2,
@@ -112,12 +115,8 @@ static const struct dwarf_abbrev *abbrev_find(const struct dwarf_abbrev_table *t
 static bool die_read(const struct dwarf_unit *unit, const struct dwarf_abbrev_table *table,
                      struct dwarf_cursor *c, const struct dwarf_abbrev **abbrev_out,
                      struct dwarf_die_values *values_out);
-static bool form_value(struct dwarf_cursor *c, const struct dwarf_unit *unit, uint64_t form,
-                       int64_t implicit_const, uint64_t *number_out);
 static bool form_block(struct dwarf_cursor *c, uint64_t length_bytes);
 static enum dwarf_form_class form_class(uint64_t form);
-static dwarf_strid name_strid(uint64_t form, uint64_t number);
-static dwarf_strid strid_make(enum dwarf_string_section section, uint64_t offset);
 static uint64_t high_pc_absolute(const struct dwarf_die_values *values);
 static bool function_append(struct dwarf *d, uint32_t unit, const struct dwarf_die_values *values);
 static bool function_search(const struct dwarf *d, uint32_t unit, uint64_t address_file,
@@ -140,6 +139,7 @@ int dwarf_open(struct dwarf *d, const struct elf *e, struct arena *arena) {
     section_find(e, ".debug_abbrev", &d->abbrev);
     section_find(e, ".debug_str", &d->str);
     section_find(e, ".debug_line_str", &d->line_str);
+    section_find(e, ".debug_line", &d->line);
     section_find(e, ".debug_aranges", &d->aranges);
 
     // A stripped binary is a fact about the target, not a failure of wraith.
@@ -188,10 +188,7 @@ bool dwarf_function_containing(struct dwarf *d, uint64_t address_file,
     if (d->units_count == 0) return false;
 
     uint32_t unit = 0;
-    if (!unit_by_address(d, address_file, &unit)) {
-        ranges_resolve(d);
-        if (!unit_by_address(d, address_file, &unit)) return false;
-    }
+    if (!dwarf_unit_for_address(d, address_file, &unit)) return false;
 
     if (!unit_index(d, unit)) return false;
     return function_search(d, unit, address_file, out);
@@ -214,6 +211,46 @@ bool dwarf_function_by_name(struct dwarf *d, const char *name,
     return true;
 }
 
+bool dwarf_unit_for_address(struct dwarf *d, uint64_t address_file, uint32_t *unit_out) {
+    assert(d != NULL);
+    assert(unit_out != NULL);
+    if (d->units_count == 0) return false;
+
+    if (unit_by_address(d, address_file, unit_out)) return true;
+    ranges_resolve(d);
+    return unit_by_address(d, address_file, unit_out);
+}
+
+// Reads only the root DIE, for the attributes that describe the unit itself.
+bool dwarf_unit_root(struct dwarf *d, uint32_t unit_id, struct dwarf_unit_root *out) {
+    assert(d != NULL);
+    assert(unit_id < d->units_count);
+    assert(out != NULL);
+
+    *out = (struct dwarf_unit_root){0};
+    const struct dwarf_unit *const unit = &d->units[unit_id];
+    if (unit->state == dwarf_unit_state_unsupported) return false;
+
+    struct dwarf_abbrev_table table;
+    if (!abbrev_table_read(d, unit->abbrev_offset, &table)) return false;
+
+    struct dwarf_cursor c = { .data = d->info.data,
+                              .size_bytes = (uint64_t)unit->offset + unit->length_bytes,
+                              .offset = unit->die_offset };
+
+    const struct dwarf_abbrev *abbrev = NULL;
+    struct dwarf_die_values values;
+    if (!die_read(unit, &table, &c, &abbrev, &values)) return false;
+    if (abbrev == NULL) return false;
+    if (abbrev->tag != dwarf_tag_compile_unit) return false;
+
+    out->stmt_list = values.stmt_list;
+    out->name = values.name;
+    out->comp_dir = values.comp_dir;
+    out->has_stmt_list = values.has_stmt_list;
+    return true;
+}
+
 const char *dwarf_string(const struct dwarf *d, dwarf_strid id) {
     assert(d != NULL);
     if (id == dwarf_strid_none) return NULL;
@@ -225,6 +262,7 @@ const char *dwarf_string(const struct dwarf *d, dwarf_strid id) {
     if (section == dwarf_string_section_str) source = &d->str;
     if (section == dwarf_string_section_line_str) source = &d->line_str;
     if (section == dwarf_string_section_info) source = &d->info;
+    if (section == dwarf_string_section_line) source = &d->line;
     if (source == NULL) return NULL;
     if (source->data == NULL) return NULL;
     if (offset >= source->size_bytes) return NULL;
@@ -645,7 +683,6 @@ static bool abbrev_table_read(const struct dwarf *d, uint32_t offset,
             abbrev.attributes_count++;
         }
 
-        if (count == dwarf_abbrevs_max) return false;
         dwarf_abbrev_pool[count] = abbrev;
         count++;
     }
@@ -689,11 +726,23 @@ static bool die_read(const struct dwarf_unit *unit, const struct dwarf_abbrev_ta
             &table->attributes[abbrev->attributes_first + i];
 
         uint64_t number = 0;
-        if (!form_value(c, unit, spec->form, spec->implicit_const, &number)) return false;
+        if (!dwarf_form_value(c, unit->address_size, spec->form, spec->implicit_const,
+                              &number)) {
+            return false;
+        }
 
         switch (spec->attribute) {
         case dwarf_attribute_name:
-            values_out->name = name_strid(spec->form, number);
+            values_out->name = dwarf_form_strid(spec->form, number,
+                                                dwarf_string_section_info);
+            break;
+        case dwarf_attribute_comp_dir:
+            values_out->comp_dir = dwarf_form_strid(spec->form, number,
+                                                    dwarf_string_section_info);
+            break;
+        case dwarf_attribute_stmt_list:
+            values_out->stmt_list = number;
+            values_out->has_stmt_list = true;
             break;
         case dwarf_attribute_low_pc:
             values_out->low_pc = number;
@@ -714,10 +763,9 @@ static bool die_read(const struct dwarf_unit *unit, const struct dwarf_abbrev_ta
     return true;
 }
 
-// Always consumes exactly the form's bytes; number_out is meaningful only for
-// the classes this chapter reads. Returns false when the length is unknowable.
-static bool form_value(struct dwarf_cursor *c, const struct dwarf_unit *unit, uint64_t form,
-                       int64_t implicit_const, uint64_t *number_out) {
+// Consumes exactly the form's bytes, and reports a form whose length is unknowable.
+bool dwarf_form_value(struct dwarf_cursor *c, uint8_t address_size, uint64_t form,
+                      int64_t implicit_const, uint64_t *number_out) {
     dwarf_assert_hot(c != NULL);
     dwarf_assert_hot(number_out != NULL);
 
@@ -740,8 +788,11 @@ static bool form_value(struct dwarf_cursor *c, const struct dwarf_unit *unit, ui
 
     switch (form) {
     case dwarf_form_addr:
-        *number_out = dwarf_cursor_fixed(c, unit->address_size);
+        *number_out = dwarf_cursor_fixed(c, address_size);
         return !c->overrun;
+    // Sixteen bytes do not fit a uint64_t, so this form is skipped, never read.
+    case dwarf_form_data16:
+        return dwarf_cursor_bytes(c, 16) != NULL;
     case dwarf_form_string: {
         // The handle is the offset of the bytes inside .debug_info itself.
         const uint64_t start = c->offset;
@@ -829,23 +880,24 @@ static enum dwarf_form_class form_class(uint64_t form) {
     }
 }
 
-static dwarf_strid name_strid(uint64_t form, uint64_t number) {
+dwarf_strid dwarf_form_strid(uint64_t form, uint64_t number,
+                             enum dwarf_string_section inline_section) {
     switch (form) {
     case dwarf_form_strp:
     case dwarf_form_strp_sup:
-        return strid_make(dwarf_string_section_str, number);
+        return dwarf_strid_make(dwarf_string_section_str, number);
+    // GCC puts file names here, and resolving this offset against .debug_str
+    // instead yields a real, correctly terminated, completely wrong string.
     case dwarf_form_line_strp:
-        // GCC puts file names here. Resolving this offset against .debug_str
-        // instead yields a real, correctly terminated, completely wrong string.
-        return strid_make(dwarf_string_section_line_str, number);
+        return dwarf_strid_make(dwarf_string_section_line_str, number);
     case dwarf_form_string:
-        return strid_make(dwarf_string_section_info, number);
+        return dwarf_strid_make(inline_section, number);
     default:
         return dwarf_strid_none;
     }
 }
 
-static dwarf_strid strid_make(enum dwarf_string_section section, uint64_t offset) {
+dwarf_strid dwarf_strid_make(enum dwarf_string_section section, uint64_t offset) {
     dwarf_assert_hot(section != dwarf_string_section_none);
     if (offset > dwarf_strid_offset_max) return dwarf_strid_none;
     return ((dwarf_strid)section << dwarf_strid_offset_bits) | (dwarf_strid)offset;

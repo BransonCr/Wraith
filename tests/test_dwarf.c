@@ -32,6 +32,21 @@ enum {
     multi_other_low = 0x401126,
 };
 
+// Rows from `readelf --debug-dump=decodedline target`.
+enum {
+    target_line_signal = 0x40119e,       // target.c:15.
+    target_line_printf = 0x4011b2,       // target.c:17, is_stmt.
+    target_line_printf_tail = 0x4011b9,  // target.c:17, is_stmt clear.
+    target_line_loop_entry = 0x4011de,   // target.c:22, first pass.
+    target_line_loop_again = 0x4011e5,   // target.c:22, per iteration.
+    target_line_end = 0x40120f,          // The end-of-sequence row.
+};
+
+enum {
+    multi_main_line_six = 0x40111a,
+    multi_other_line_six = 0x40112a,
+};
+
 static void test_leb128(void) {
     // Single byte, the common case: DWARF uses LEB128 because most numbers are
     // small and cost one byte.
@@ -146,6 +161,70 @@ static void test_target_by_name(struct dwarf *d) {
            dwarf_units_indexed(d));
 }
 
+static void test_target_lines(struct dwarf *d) {
+    // 7.2 again: a name and an address lookup must not have decoded a program.
+    assert(dwarf_lines_decoded(d) == 0);
+
+    struct dwarf_line_info info = {0};
+
+    assert(dwarf_line_at_address(d, target_main_low, &info));
+    assert(info.file != NULL);
+    assert(strcmp(info.file, "target.c") == 0);
+    assert(info.line == 14);
+    assert(dwarf_lines_decoded(d) == 1);
+
+    // A row means "from here until the next", so the byte after one is still it.
+    assert(dwarf_line_at_address(d, target_line_signal + 1, &info));
+    assert(info.line == 15);
+    assert(info.address == target_line_signal);
+
+    // The terminator is a fence post; read as a line it claims every address above.
+    assert(!dwarf_line_at_address(d, target_line_end, &info));
+
+    // Line 22 is the while condition, emitted on entry and again per iteration.
+    uint64_t addresses[8] = {0};
+    assert(dwarf_line_addresses(d, "target.c", 22, addresses, 8) == 2);
+    assert(addresses[0] == target_line_loop_entry);
+    assert(addresses[1] == target_line_loop_again);
+
+    // Line 17 has a second row with is_stmt clear, mid-call, which is no location.
+    assert(dwarf_line_addresses(d, "target.c", 17, addresses, 8) == 1);
+    assert(addresses[0] == target_line_printf);
+    assert(target_line_printf_tail > target_line_printf);
+
+    assert(dwarf_line_addresses(d, "wraith/target.c", 14, addresses, 8) == 1);
+    assert(dwarf_line_addresses(d, "aith/target.c", 14, addresses, 8) == 0);
+    assert(dwarf_line_addresses(d, "other/target.c", 14, addresses, 8) == 0);
+    assert(dwarf_line_addresses(d, "target.c", 3, addresses, 8) == 0);
+
+    printf("  target: line table ok, %" PRIu32 " program decoded\n",
+           dwarf_lines_decoded(d));
+}
+
+static void test_multi_lines(struct dwarf *d) {
+    struct dwarf_line_info info = {0};
+
+    // main.c's terminator and other.c's first row share 0x401126, and sorting the
+    // terminator first is what makes the live row win here.
+    assert(dwarf_line_at_address(d, multi_other_low, &info));
+    assert(strcmp(info.file, "target_multi_other.c") == 0);
+    assert(info.line == 5);
+
+    assert(dwarf_line_at_address(d, multi_main_low, &info));
+    assert(strcmp(info.file, "target_multi_main.c") == 0);
+    assert(info.line == 5);
+
+    // Both units have a line 6, so only the named file's may answer.
+    uint64_t addresses[4] = {0};
+    assert(dwarf_line_addresses(d, "target_multi_other.c", 6, addresses, 4) == 1);
+    assert(addresses[0] == multi_other_line_six);
+    assert(dwarf_line_addresses(d, "target_multi_main.c", 6, addresses, 4) == 1);
+    assert(addresses[0] == multi_main_line_six);
+
+    assert(dwarf_lines_decoded(d) == 2);
+    printf("  target_multi: two line tables, no cross talk\n");
+}
+
 static void test_multi(struct dwarf *d) {
     // Two units, two abbreviation tables at different offsets. Verified with
     // readelf: code 3 is DW_TAG_subprogram in the first table and
@@ -174,6 +253,8 @@ static void test_multi(struct dwarf *d) {
     assert(dwarf_units_indexed(d) == 2);
     printf("  target_multi: %" PRIu32 " units, both tables read ok\n",
            dwarf_units_indexed(d));
+
+    test_multi_lines(d);
 }
 
 static void test_binary(const char *path, void (*checks)(struct dwarf *)) {
@@ -211,6 +292,7 @@ static void test_target_all(struct dwarf *d) {
     test_target_units(d);
     test_target_by_address(d);
     test_target_by_name(d);
+    test_target_lines(d);
 }
 
 int main(void) {

@@ -20,8 +20,10 @@ enum dwarf_tag {
 
 enum dwarf_attribute {
     dwarf_attribute_name = 0x03,
+    dwarf_attribute_stmt_list = 0x10,
     dwarf_attribute_low_pc = 0x11,
     dwarf_attribute_high_pc = 0x12,
+    dwarf_attribute_comp_dir = 0x1b,
 };
 
 enum dwarf_form {
@@ -80,11 +82,13 @@ enum dwarf_string_section {
     dwarf_string_section_str = 1,
     dwarf_string_section_line_str = 2,
     dwarf_string_section_info = 3,
+    dwarf_string_section_line = 4,
 };
 
+// Five sections need three bits, which leaves 512 MiB of offset per section.
 enum {
     dwarf_strid_none = 0,
-    dwarf_strid_offset_bits = 30,
+    dwarf_strid_offset_bits = 29,
     dwarf_strid_offset_max = (1u << dwarf_strid_offset_bits) - 1,
 };
 
@@ -141,6 +145,53 @@ struct dwarf_function_info {
     uint64_t high_pc;
 };
 
+enum dwarf_line_state {
+    dwarf_line_state_unread = 0,
+    dwarf_line_state_ready = 1,
+    dwarf_line_state_unsupported = 2,
+};
+
+enum dwarf_line_flag {
+    dwarf_line_flag_statement = 1u << 0,
+    dwarf_line_flag_end_sequence = 1u << 1,
+    dwarf_line_flag_prologue_end = 1u << 2,
+};
+
+// INVARIANT: sorted by address ascending, an end-of-sequence row first on a tie.
+struct dwarf_line_row {
+    uint64_t address;  // File address.
+    uint32_t line;
+    uint16_t file;     // Index into dwarf_line_table::files.
+    uint16_t flags;
+};
+
+static_assert(sizeof(struct dwarf_line_row) == 16, "four rows per cache line");
+
+struct dwarf_line_file {
+    dwarf_strid directory;
+    dwarf_strid name;
+};
+
+static_assert(sizeof(struct dwarf_line_file) == 8, "eight names per cache line");
+
+// INVARIANT: rows and files are set only once state is dwarf_line_state_ready.
+struct dwarf_line_table {
+    struct dwarf_line_row *rows;
+    struct dwarf_line_file *files;
+    uint32_t rows_count;
+    uint32_t files_count;
+    uint8_t state;
+};
+
+static_assert(sizeof(struct dwarf_line_table) == 32, "two tables per cache line");
+
+struct dwarf_line_info {
+    const char *directory;  // NULL when the entry named no directory.
+    const char *file;       // NULL when the path did not resolve.
+    uint64_t address;       // File address of the row, at or below the query.
+    uint32_t line;
+};
+
 // INVARIANT: range_low is sorted ascending; range_high and range_unit are parallel.
 // INVARIANT: ranges_count <= ranges_capacity, both fixed after dwarf_open.
 // INVARIANT: every pointer aims into the arena or into the elf mapping; nothing is owned.
@@ -152,6 +203,7 @@ struct dwarf {
     struct dwarf_section abbrev;
     struct dwarf_section str;
     struct dwarf_section line_str;
+    struct dwarf_section line;
     struct dwarf_section aranges;
 
     struct dwarf_unit *units;
@@ -160,6 +212,7 @@ struct dwarf {
     uint32_t *range_unit;
     struct dwarf_function *functions;
     struct dwarf_name_slot *names;
+    struct dwarf_line_table *lines;  // One per unit, NULL until the first query.
 
     uint32_t units_count;
     uint32_t ranges_count;
@@ -183,6 +236,14 @@ bool dwarf_function_containing(struct dwarf *d, uint64_t address_file,
                                struct dwarf_function_info *out);
 bool dwarf_function_by_name(struct dwarf *d, const char *name,
                             struct dwarf_function_info *out);
+
+// Syscall budget: 0.
+// Allocation: module arena, on the first query against a unit. No malloc.
+bool dwarf_line_at_address(struct dwarf *d, uint64_t address_file,
+                           struct dwarf_line_info *out);
+uint32_t dwarf_line_addresses(struct dwarf *d, const char *path, uint32_t line,
+                              uint64_t *out, uint32_t count_max);
+uint32_t dwarf_lines_decoded(const struct dwarf *d);
 
 const char *dwarf_string(const struct dwarf *d, dwarf_strid id);
 

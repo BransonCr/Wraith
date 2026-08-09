@@ -5,6 +5,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "dwarf/dwarf.h"
+
 // Assertions stay on in every wraith build. These readers run once per byte of
 // .debug_info, so PERFORMANCE.md 11.8 exempts them alone -- keyed on a macro of
 // our own rather than NDEBUG, so nothing else goes quiet along with them.
@@ -113,5 +115,21 @@ static inline const char *dwarf_cursor_string(struct dwarf_cursor *c) {
     c->offset = c->size_bytes;
     return NULL;
 }
+
+struct dwarf_unit_root {
+    uint64_t stmt_list;
+    dwarf_strid name;
+    dwarf_strid comp_dir;
+    bool has_stmt_list;
+};
+
+bool dwarf_unit_for_address(struct dwarf *d, uint64_t address_file, uint32_t *unit_out);
+bool dwarf_unit_root(struct dwarf *d, uint32_t unit_id, struct dwarf_unit_root *out);
+
+bool dwarf_form_value(struct dwarf_cursor *c, uint8_t address_size, uint64_t form,
+                      int64_t implicit_const, uint64_t *number_out);
+dwarf_strid dwarf_form_strid(uint64_t form, uint64_t number,
+                             enum dwarf_string_section inline_section);
+dwarf_strid dwarf_strid_make(enum dwarf_string_section section, uint64_t offset);
 
 #endif  // WRAITH_DWARF_DWARF_INTERNAL_H_
