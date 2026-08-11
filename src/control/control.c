@@ -21,6 +21,8 @@ static int control_disarm(struct control_breakpoint *breakpoint, struct process 
 static int control_step_over(struct control_breakpoint *breakpoint, struct process *p,
                              struct stop_reason *reason_out);
 static void control_rewind(struct control *c, struct process *p);
+static bool control_run_to_arrived(struct process *p, uint64_t address);
+//
 // Sets which syscalls stop the program. numbers and count are read only in
 // CONTROL_CATCH_SOME mode and ignored otherwise, so a caller selecting ALL or
 // NONE passes NULL and 0.
@@ -263,6 +265,84 @@ static void control_signal_remember(struct control *c, struct stop_reason reason
             assert(false);  // Adding a trap kind must fail loudly here.
             break;
     }
+}
+
+int control_run_to(struct control *c, struct process *p, uint64_t address,
+                   struct stop_reason *reason_out) {
+    assert(c != NULL);
+    assert(p != NULL);
+    assert(reason_out != NULL);
+    assert(c->count <= control_breakpoints_max);
+
+    struct control_breakpoint *breakpoint = control_find_by_address(c, address);
+    const bool borrowed = breakpoint != NULL;
+
+    if (!borrowed) {
+        if (c->count == control_breakpoints_max) {
+            fprintf(stderr, "breakpoint table is full (%d max)\n", control_breakpoints_max);
+            return -1;
+        }
+        breakpoint = &c->breakpoints[c->count];
+        *breakpoint = (struct control_breakpoint){
+            .address = address,
+            .id = 0,
+            .original_byte = 0,
+            .enabled = false,
+        };
+        c->count++;
+    }
+
+    // A row the user left armed needs nothing done to it, and must still be
+    // armed afterwards. Only a row this call armed is disarmed again, which
+    // covers a row the user set and then disabled.
+    const bool armed_here = !breakpoint->enabled;
+    if (armed_here) {
+        if (control_arm(breakpoint, p) == -1) {
+            if (!borrowed) c->count--;
+            return -1;
+        }
+    }
+
+    const int result = control_continue(c, p, reason_out);
+
+    // Our own trap is not news the caller can act on, so report it as the step
+    // it stands in for. Guarded on the trap kind as well as the address: a
+    // signal delivered at this exact address is the tracee's, not ours.
+    if (armed_here) {
+        if (reason_out->trap == PROC_TRAP_BREAKPOINT) {
+            if (control_run_to_arrived(p, address)) reason_out->trap = PROC_TRAP_STEP;
+        }
+    }
+
+    if (armed_here) {
+        if (process_gone(p)) {
+            breakpoint->enabled = false;
+        } else {
+            if (control_disarm(breakpoint, p) == -1) {
+                fprintf(stderr, "could not remove the trap at 0x%016" PRIx64 "\n", address);
+            }
+        }
+    }
+
+    if (!borrowed) {
+        assert(c->count > 0);
+        assert(breakpoint == &c->breakpoints[c->count - 1]);
+        c->count--;
+    }
+    return result;
+}
+
+static bool control_run_to_arrived(struct process *p, uint64_t address) {
+    //so much fluff
+    assert(p != NULL);
+
+    if(process_gone(p)) return false;
+
+    const struct user_regs_struct *const registers = process_registers(p);
+    if(registers == NULL) return false;
+
+    assert(registers->rip != 0);
+    return registers->rip == address;
 }
 // Syscall budget: 0, or 1 in CONTROL_CATCH_SOME.
 // Allocation: none.
