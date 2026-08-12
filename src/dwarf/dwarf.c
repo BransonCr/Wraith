@@ -10,23 +10,15 @@
 #include "elf/elf.h"
 
 enum {
-    // The smallest possible unit: a 4-byte length, the 8 remaining header bytes
-    // of DWARF 5, and not one DIE. Nothing can be smaller, so it bounds the unit
-    // count. Reserving the bound costs address space, not memory.
+
     dwarf_unit_bytes_min = 12,
 
-    // A subprogram this indexer keeps carries an abbreviation code, a name
-    // reference and two address attributes, so no unit holds more functions
-    // than its bytes divided by this.
+s.
     dwarf_function_bytes_min = 14,
 
     // One .debug_aranges tuple is two addresses.
     dwarf_arange_bytes = 16,
 
-    // The abbreviation table is scratch: decoded per unit, consumed inside one
-    // call, never stored. A static pool per CLAUDE.md rule 8 rather than an
-    // arena, because arenas cannot hand memory back. Valid only for the
-    // duration of one unit walk, which is safe because rule 7 is single-threaded.
     dwarf_abbrevs_max = 2048,
     dwarf_abbrev_attributes_max = 16384,
 

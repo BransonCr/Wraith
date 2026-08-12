@@ -72,7 +72,6 @@ struct dwarf_line_registers {
     uint16_t flags;
 };
 
-// Scratch for one header parse, consumed before the next, per CLAUDE.md rule 8.
 static dwarf_strid dwarf_line_directory_pool[dwarf_line_directories_max];
 
 static bool tables_reserve(struct dwarf *d);
