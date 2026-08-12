@@ -233,7 +233,6 @@ int main(int argc, char **argv) {
 }
 // wraith <program>  launches it under trace.
 // wraith -p <pid>   attaches to a process already running.
-// Both paths must reach the same place: a stopped tracee with a known pid.
 static int target_open(int argc, char **argv, struct process *out) {
     assert(argv != NULL);
     assert(out != NULL);
@@ -253,10 +252,6 @@ static int target_open(int argc, char **argv, struct process *out) {
     return -1;
 }
 
-// Parses a decimal pid, returning 0 for anything that is not one. 0 is a safe
-// failure value because it is never a process we could trace, and strtol alone
-// is not enough: it reports "banana" as 0 through the return value, which is
-// indistinguishable from success without checking where it stopped.
 static pid_t pid_parse(const char *text) {
     assert(text != NULL);
 
@@ -272,7 +267,7 @@ static pid_t pid_parse(const char *text) {
     return (pid_t)value;
 }
 
-// Prompts and reads one line, with the newline stripped. Returns false at EOF,
+// Returns false at EOF,
 // which is how ctrl-D ends the session.
 static bool command_read(char *buffer, size_t buffer_size) {
     assert(buffer != NULL);
@@ -323,7 +318,7 @@ static void command_handle(struct control *c, struct process *p, const struct el
 
     char *words[main_words_max];
     const uint32_t count = command_split(command, words, main_words_max);
-    if (count == 0) return;  // A bare enter is not an error.
+    if (count == 0) return;  //bare enter != err
     if (count > main_words_max) {
         fprintf(stderr, "too many arguments (%d max)\n", main_words_max);
         return;
@@ -433,15 +428,12 @@ static void stop_print(struct process *p, const struct elf *elf, struct dwarf *d
             stop_print_trap(p, reason);
             break;
         }
-        // A running process is not a stop reason, and a value outside the enum
-        // is a bug in us, not in the tracee. Adding a state fails loudly here.
         default:
             assert(false);
             break;
     }
 }
 // The second line of a stop, when there is one to say. Kept out of stop_print
-// so that function stays a switch over the lifecycle and nothing else.
 static void stop_print_trap(struct process *p, struct stop_reason reason) {
     assert(p != NULL);
     assert(reason.reason == PROC_STOPPED);
@@ -464,14 +456,13 @@ static void stop_print_trap(struct process *p, struct stop_reason reason) {
     }
 
     // is_error comes from the kernel rather than from the sign of the return
-    // value, because a negative return is ambiguous: mmap legitimately returns
+    // value, because a negative return is ambiguous: mmap returns
     // addresses whose top bit is set.
     printf("  syscall exit  %s(%u) = %" PRId64 "%s\n", name != NULL ? name : "syscall",
            syscall->number, syscall->result, syscall->error ? " (error)" : "");
 }
 
-// Appends the function an address falls inside, when there is one. Silence is
-// the honest answer for a stripped binary, or for an address in the loader.
+// Appends the function an address falls inside, when there is one. 
 static void symbol_print_at(const struct elf *elf, uint64_t load_bias, uint64_t address) {
     if (elf == NULL) return;
     assert(elf->size_bytes > 0);
@@ -523,9 +514,7 @@ static void command_symbol(const struct elf *elf, uint64_t load_bias, char *cons
             fprintf(stderr, "no symbol named %s\n", words[1]);
             return;
         }
-
-        // A symbol in no section has no runtime address: an undefined import
-        // carries st_value 0, which would otherwise print as the load bias.
+        
         uint64_t address = 0;
         if (!elf_address_virtual(elf, load_bias, symbol->st_value, &address)) {
             fprintf(stderr, "%s has no runtime address\n", words[1]);
@@ -560,8 +549,6 @@ static void command_function(const struct elf *elf, struct dwarf *dwarf, uint64_
                 fprintf(stderr, "not an address: %s\n", words[2]);
                 return;
             }
-            // The tracee's addresses and the file's differ by the load bias, and
-            // an address in no section of this file belongs to no function of it.
             uint64_t address_file = 0;
             if (!elf_address_file(elf, load_bias, address_virtual, &address_file)) {
                 fprintf(stderr, "0x%016" PRIx64 " is not in this file\n", address_virtual);
@@ -817,12 +804,6 @@ static bool prefix_match(const char *text, const char *full) {
     return strncmp(text, full, text_length) == 0;
 }
 
-//
-// Prefix matching with a floor, for subcommands that share a first letter.
-// "disable" and "delete" both start with "d", and a plain prefix match would
-// hand "d" to whichever the dispatch happens to test first — silently deleting
-// a breakpoint the user meant to keep. Three characters disambiguates them, so
-// both demand three and a bare "d" falls through to the usage line.
 static bool prefix_match_least(const char *text, const char *full, size_t length_least) {
     assert(text != NULL);
     assert(full != NULL);
@@ -1044,8 +1025,8 @@ static void memory_print(const struct control *c, struct process *p, uint64_t ad
     assert(size_bytes > 0);
     assert(size_bytes <= main_memory_bytes_max);
 
-    // Through control, never through process: a raw read shows wraith's own
-    // 0xCC wherever a breakpoint is armed, and the user did not put it there.
+    // raw read shows wraith's own
+    // 0xCC wherever a breakpoint is armed
     uint8_t bytes[main_memory_bytes_max];
     const int64_t moved = control_memory_read(c, p, address, bytes, size_bytes);
     if (moved <= 0) {
@@ -1053,9 +1034,7 @@ static void memory_print(const struct control *c, struct process *p, uint64_t ad
         return;
     }
     assert(moved <= (int64_t)size_bytes);
-
-    // A short read is normal at the end of a mapping, so print what arrived
-    // rather than what was asked for.
+    
     const uint32_t moved_bytes = (uint32_t)moved;
     for (uint32_t offset = 0; offset < moved_bytes; offset += main_memory_bytes_per_line) {
         printf("0x%016" PRIx64 ":", address + offset);
@@ -1080,14 +1059,12 @@ static void memory_patch(struct control *c, struct process *p, uint64_t address,
         return;
     }
 
-    // Through control, so a write landing on an armed breakpoint updates the
-    // saved byte instead of erasing the trap that makes it work.
+  
     if (control_memory_write(c, p, address, bytes, count) == -1) return;
     printf("wrote %u byte%s at 0x%016" PRIx64 "\n", count, count == 1 ? "" : "s", address);
 }
 // Parses "write,openat" or "1,257" into syscall numbers, returning the count.
-// Returns 0 for anything malformed, which is a safe failure value because a
-// zero-syscall catchpoint is meaningless and so can never be a real answer.
+// Returns 0 for anything malformed
 static uint32_t syscalls_parse(const char *text, uint16_t *out, uint32_t count_max) {
     assert(text != NULL);
     assert(out != NULL);
@@ -1121,34 +1098,23 @@ static uint32_t syscalls_parse(const char *text, uint16_t *out, uint32_t count_m
     return count;
 }
 
-// One token of that list, by name or by number. Named for its caller so the
-// call history reads off the page.
 static bool syscalls_parse_one(const char *token, size_t length, uint16_t *out) {
     assert(token != NULL);
     assert(length > 0);
     assert(out != NULL);
 
-    // strtoul and syscall_number both want a NUL, and a token is a slice of a
-    // longer string, so it is copied before either of them sees it.
     if (length >= main_syscall_name_bytes_max) return false;
 
     char name[main_syscall_name_bytes_max];
     memcpy(name, token, length);
     name[length] = '\0';
 
-    // A leading digit means a number, anything else means a name. Deciding on
-    // the first character, rather than trying strtoul and falling back on
-    // failure, keeps the two dialects from overlapping: base 0 would otherwise
-    // read a name beginning with a hex digit as a partial number.
-    //
-    // The cast is not decoration: isdigit is undefined for a negative char, and
-    // char is signed on x86-64.
+    // A leading digit means a number, anything else means a name
     if (!isdigit((unsigned char)name[0])) {
         return syscall_number(name, out);
     }
 
     // Base 0, so 1, 0x1 and 01 all work, matching value_parse and bytes_parse
-    // rather than inventing a third numeric dialect for the same debugger.
     char *end = NULL;
     errno = 0;
     const unsigned long value = strtoul(name, &end, 0);
@@ -1253,8 +1219,7 @@ static void command_disassemble(struct control *c, struct process *p, char *cons
         }
     }
 
-    // rip is the default because it is the one address guaranteed to be an
-    // instruction boundary. x86-64 instructions are variable length, so
+    // x86-64 instructions are variable length, so
     // starting anywhere else is the caller promising they know what they are
     // pointing at.
     if (!address_given) {
@@ -1273,17 +1238,11 @@ static void disassembly_print(const struct control *c, struct process *p, uint64
     assert(instructions_count > 0);
     assert(instructions_count <= main_disassemble_count_max);
 
-    // 15 bytes per instruction is the architectural maximum, so this is the
-    // smallest request that cannot run out of input before the decoder has
-    // produced the instructions asked for. It over-reads most of the time, and
-    // that costs nothing: it is one syscall either way.
+    // 15 bytes per instruction is the max,
     uint8_t bytes[main_disassemble_count_max * disassembler_instruction_size_bytes_max];
     const uint32_t size_bytes = instructions_count * disassembler_instruction_size_bytes_max;
 
-    // The single most important call in this file. control_memory_read paints
-    // saved original bytes back over every armed breakpoint; process_memory_read
-    // does not. Read raw and every breakpoint in range decodes as int3, which is
-    // wraith's byte, not the program's.
+    //important call
     const int64_t moved = control_memory_read(c, p, address, bytes, size_bytes);
     if (moved <= 0) {
         fprintf(stderr, "could not read code at 0x%016" PRIx64 "\n", address);
@@ -1362,9 +1321,6 @@ static void register_set_one(struct process *p, const char *name, const char *te
     const struct user_regs_struct *const current = process_registers(p);
     if (current == NULL) return;
 
-    // Edit a copy and hand the whole block down, rather than reaching into the
-    // cache: the ui layer states its intent as data and process owns when that
-    // data crosses the kernel boundary.
     struct user_regs_struct block = *current;
     register_write(&block, info, value);
     if (process_registers_set(p, &block) == -1) return;
@@ -1373,8 +1329,6 @@ static void register_set_one(struct process *p, const char *name, const char *te
 }
 
 // Base 0, so 0x1f, 037 and 31 all work the way the user expects from gdb.
-// A typo must not silently become 0 and get written to rip, so every failure
-// mode strtoull has is checked rather than folded into the return value.
 static bool value_parse(const char *text, uint64_t *out) {
     assert(text != NULL);
     assert(out != NULL);
