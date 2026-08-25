@@ -183,7 +183,7 @@ static bool tables_reserve(struct dwarf *d) {
     return true;
 }
 
-// Decodes one unit's program on first need and caches the rows. PERFORMANCE.md 7.3.
+// Decodes one unit's program on first need and caches the rows. 
 static const struct dwarf_line_table *table_read(struct dwarf *d, uint32_t unit_id) {
     assert(d != NULL);
     assert(unit_id < d->units_count);

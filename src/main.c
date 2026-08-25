@@ -164,7 +164,7 @@ static bool symbols_open(struct process *p, struct elf *elf, uint64_t *load_bias
     if (elf_open(path, elf) == -1) return false;
 
     // After the exec, never before. /proc/<pid>/auxv is readable either way,
-    // and before the exec it still describes wraith's own image — so a bias
+    // and before the exec it still describes wraith's own image  so a bias
     // taken there is wrong, and looks entirely plausible.
     uint64_t entry_virtual = 0;
     if (!process_auxv(p, AT_ENTRY, &entry_virtual)) {
