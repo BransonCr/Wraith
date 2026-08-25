@@ -60,7 +60,7 @@ int process_launch(const char *path, struct process *out) {
         if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1) {
             process_launch_child_fail(status_pipe[1], errno);
         }
-        execlp(path, path, NULL);
+        execlp(path, path, NULL); // Replace process image with tracee
         process_launch_child_fail(status_pipe[1], errno);
     }
 
@@ -458,7 +458,7 @@ static _Noreturn void process_launch_child_fail(int pipe_write, int error_number
     const uint8_t *const bytes = (const uint8_t *)&error_number;
     size_t written_total = 0;
 
-    for (uint32_t attempt = 0; attempt < attempts_max; attempt++) {
+    for (uint32_t i = 0; i < attempts_max; i++) {
         if (written_total == sizeof error_number) break;
         const ssize_t written = write(pipe_write, bytes + written_total,
                                       sizeof error_number - written_total);
