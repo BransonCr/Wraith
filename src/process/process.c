@@ -35,9 +35,6 @@ int process_launch(const char *path, struct process *out) {
     assert(path != NULL);
     assert(out != NULL);
 
-    // The exec-status pipe. O_CLOEXEC is the whole trick: a successful exec
-    // closes the write end for me, so the parent's read sees EOF and reads
-    // that as "exec worked". A failed exec writes its errno through it first.
     int status_pipe[2] = {-1, -1};
     if (pipe2(status_pipe, O_CLOEXEC) == -1) {
         perror("pipe2");
@@ -56,11 +53,6 @@ int process_launch(const char *path, struct process *out) {
         // --- CHILD ---
         close(status_pipe[0]);
 
-        // Leave wraith's process group before exec, so the terminal's ctrl-C
-        // reaches only the debugger. Otherwise the tty delivers SIGINT to the
-        // tracee directly and races the SIGSTOP the handler is sending it.
-        // The cost is that the tracee is no longer the foreground group, so a
-        // debuggee that reads from the terminal now earns SIGTTIN.
         if (setpgid(0, 0) == -1) {
             process_launch_child_fail(status_pipe[1], errno);
         }
@@ -82,8 +74,7 @@ int process_launch(const char *path, struct process *out) {
 
     if (bytes_read == 0) return process_start(out, pid, true);
 
-    // Anything but EOF means the child never reached main. Say why, and reap
-    // it so we do not leave a zombie behind.
+
     if (bytes_read == (ssize_t)sizeof child_errno) {
         fprintf(stderr, "launch %s: %s\n", path, strerror(child_errno));
     } else {
@@ -96,8 +87,7 @@ int process_launch(const char *path, struct process *out) {
 int process_attach(pid_t pid, struct process *out) {
     assert(out != NULL);
 
-    // A bad pid is an operating error, not a programmer error: it comes from
-    // the user, so it is validated and reported, never asserted.
+
     if (pid <= 0) {
         fprintf(stderr, "invalid pid: %d\n", pid);
         return -1;
@@ -137,9 +127,6 @@ int process_resume(struct process *p, int signal_number) {
     assert(p->pid > 0);
     assert(signal_number >= 0);
 
-    // A tracee that has exited cannot be continued. Checking state first turns
-    // a guaranteed-to-fail syscall into no syscall at all (6.1), and gives the
-    // caller a better message than ESRCH.
     if (p->state == PROC_STOPPED) {
         // The edit must reach the tracee before it runs again.
         if (process_registers_flush(p) == -1) return -1;
@@ -158,10 +145,7 @@ int process_resume(struct process *p, int signal_number) {
     }
 }
 
-// A third near-copy rather than a request parameter, for the same reason
-// process_step is one: the ptrace request stays readable at the call site, and
-// the caller's choice between cheap and expensive resume is a branch the caller
-// writes rather than a flag it fills in.
+
 int process_resume_syscall(struct process *p, int signal_number) {
     assert(p != NULL);
     assert(p->pid > 0);
@@ -187,13 +171,9 @@ struct stop_reason process_wait(struct process *p) {
     assert(p != NULL);
     assert(p->pid > 0);
 
-    // Invalidate before the wait, not after: no path may read a register block
-    // that describes a moment already gone (place-of-check to place-of-use).
     p->registers_dirty = false;
     p->registers_valid = false;
 
-    // If waitpid itself fails we do not know what the tracee is doing, so the
-    // default says "not stopped" and every caller treats it as failure.
     struct stop_reason reason = {.reason = PROC_TERMINATED, .info = 0};
 
     int status = 0;
@@ -318,8 +298,7 @@ bool process_auxv(const struct process *p, uint64_t type, uint64_t *out) {
         return false;
     }
 
-    // The vector is 368 bytes on this kernel, so 64 pairs is a ceiling with
-    // room to spare, and reading it whole keeps the scan to one pass.
+    // The vector is 368 bytes on this kernel
     enum { auxv_pairs_max = 64 };
     uint64_t pairs[auxv_pairs_max * 2] = {0};
     size_t filled = 0;
@@ -383,14 +362,7 @@ const struct process_syscall *process_syscall(struct process *p) {
         memcpy(p->syscall.arguments, information.entry.args,
                sizeof p->syscall.arguments);
     } else {
-        // op is NONE at every stop that is not a syscall stop, which is also
-        // what it reports if TRACESYSGOOD was never set: the kernel derives
-        // entry-against-exit from the same bit the option controls.
         if (information.op != PTRACE_SYSCALL_INFO_EXIT) return NULL;
-
-        // The exit record carries the return value but not the number. That
-        // still lives in orig_rax, which the kernel preserves across the call
-        // precisely so a tracer can ask what the syscall was on the way out.
         const struct user_regs_struct *const registers = process_registers(p);
         if (registers == NULL) return NULL;
 
@@ -402,8 +374,6 @@ const struct process_syscall *process_syscall(struct process *p) {
         };
     }
 
-    // One success tail for both branches. Putting it inside the else is how the
-    // entry path came to fill the cache and then report nothing was there.
     p->syscall_valid = true;
     return &p->syscall;
 }
@@ -421,8 +391,6 @@ bool process_gone(const struct process *p) {
 
 int process_detach(struct process *p) {
     assert(p != NULL);
-
-    // Detaching twice is not an error; the second call has nothing to do.
     if (process_gone(p)) {
         p->pid = 0;
         p->registers_valid = false;
@@ -432,18 +400,15 @@ int process_detach(struct process *p) {
 
     int result = 0;
 
-    // PTRACE_DETACH needs a stopped tracee, so stop it if it is running.
     if (p->state == PROC_RUNNING) {
         if (process_signal(p->pid, SIGSTOP) == -1) result = -1;
         if (process_reap(p->pid) == -1) result = -1;
     }
-    // An edit is the users to keep even if tha last thing they did was detach
     if(process_registers_flush(p) == -1) result = -1;
     if (ptrace(PTRACE_DETACH, p->pid, NULL, NULL) == -1) {
         perror("PTRACE_DETACH");
         result = -1;
     }
-    // We stopped it above, so hand it back running the way we found it.
     if (process_signal(p->pid, SIGCONT) == -1) result = -1;
 
     if (p->terminate_on_end) {
@@ -451,22 +416,15 @@ int process_detach(struct process *p) {
         if (process_reap(p->pid) == -1) result = -1;
     }
 
-    // pid == 0 is the flag the other calls read, so clear it unconditionally:
-    // a failed detach still means we are no longer this process's tracer.
     p->pid = 0;
     p->registers_valid = false;
     return result;
 }
 
-// The shared tail of both entry paths. Records the tracee, waits for the stop
-// the kernel owes us, and sets the options that last for the whole attachment.
-// Both paths end here so that "attached" means exactly one thing.
 static int process_start(struct process *out, pid_t pid, bool terminate_on_end) {
     assert(out != NULL);
     assert(pid > 0);
 
-    // One initializer, so every field is written exactly once and nothing
-    // survives from whatever the caller's stack held before.
     *out = (struct process){
         .pid = pid,
         .state = PROC_RUNNING,
@@ -476,7 +434,6 @@ static int process_start(struct process *out, pid_t pid, bool terminate_on_end) 
 
     const struct stop_reason reason = process_wait(out);
     if (reason.reason != PROC_STOPPED) {
-        // It died before we ever saw it stop, so there is nothing to debug.
         fprintf(stderr, "process %d never reached a stop\n", pid);
         out->pid = 0;
         return -1;
@@ -494,14 +451,9 @@ static int process_start(struct process *out, pid_t pid, bool terminate_on_end) 
     return 0;
 }
 
-// Runs only in the child, and only once the launch has already failed: hand
-// the parent our errno, then leave. After a successful exec there is no shared
-// memory and no return value, so this pipe is the parent's only way to hear.
 static _Noreturn void process_launch_child_fail(int pipe_write, int error_number) {
     assert(pipe_write >= 0);
 
-    // A short or interrupted write would cost the parent its diagnosis, so
-    // loop; bounded, because an unbounded loop is a hang waiting to happen.
     enum { attempts_max = 8 };
     const uint8_t *const bytes = (const uint8_t *)&error_number;
     size_t written_total = 0;
@@ -519,8 +471,6 @@ static _Noreturn void process_launch_child_fail(int pipe_write, int error_number
     _exit(127);
 }
 
-// waitpid, retrying the interruption every interruptible syscall owes us.
-// Bounded (5.6): 64 signals in a row is a broken world, not a slow one.
 static pid_t process_wait_uninterrupted(pid_t pid, int *status) {
     assert(pid > 0);
     assert(status != NULL);
@@ -535,7 +485,6 @@ static pid_t process_wait_uninterrupted(pid_t pid, int *status) {
     return -1;
 }
 
-// kill(2) with the reporting every call site needs, so callers stay one line.
 static int process_signal(pid_t pid, int signal_number) {
     assert(pid > 0);
     assert(signal_number > 0);
@@ -546,9 +495,6 @@ static int process_signal(pid_t pid, int signal_number) {
     }
     return 0;
 }
-
-// Collect a status we are about to throw away, so the tracee does not linger
-// as a zombie. Named for what it is for, not for the syscall it makes.
 static int process_reap(pid_t pid) {
     assert(pid > 0);
 
@@ -582,8 +528,6 @@ static int process_registers_flush(struct process *p) {
     if(p->registers_dirty) {
         assert(p->registers_valid);
 
-        //Mirror GETREGSET above, same not type, same explicit length so the kernel
-        //validate the size rather tahn trusting out layout
         struct iovec block = {
             .iov_base = &p->registers,
             .iov_len = sizeof p->registers,
@@ -607,8 +551,6 @@ int64_t process_memory_read(struct process *p, uint64_t address, uint8_t *out, u
     assert(out != NULL);
     assert(size_bytes > 0);
 
-    //one crossing for whole range, however long, PTRACE_PEEKDATA
-    // would cost a syscall per 8 bytes: 128 for KB, against one here.
     uint32_t moved_total = 0;
     for (uint32_t pass = 0; pass < size_bytes; pass++ ){
         if(moved_total == size_bytes) break;
@@ -651,8 +593,6 @@ int process_memory_write(struct process *p, uint64_t address,
     const uint32_t word_size = (uint32_t)sizeof(long);
     uint32_t written_total = 0;
 
-    // Bounded (5.6): every pass writes at least one byte, so size_bytes passes
-    // is a ceiling no correct run can reach.
     for (uint32_t pass = 0; pass < size_bytes; pass++) {
         if (written_total == size_bytes) break;
 
@@ -660,10 +600,7 @@ int process_memory_write(struct process *p, uint64_t address,
         const uint32_t remaining = size_bytes - written_total;
         const uint32_t chunk = remaining < word_size ? remaining : word_size;
 
-        // POKEDATA moves a whole word and has no narrower setting. A full word
-        // of ours is overwritten completely, so reading it first would be a
-        // wasted syscall. A partial tail is not: without the read, the bytes
-        // past our data go back as zeroes and we erase what we never looked at.
+        // POKEDATA moves a whole word and has no narrower setting.
         long word = 0;
         if (chunk < word_size) {
             errno = 0;  // PEEK returns the word itself, so -1 alone is ambiguous.
@@ -676,8 +613,7 @@ int process_memory_write(struct process *p, uint64_t address,
             }
         }
 
-        // Little-endian: byte 0 of the word is the byte at word_address, so the
-        // low end of `word` is the end that lands first in memory.
+        // Littleendian
         memcpy(&word, source + written_total, chunk);
         if (ptrace(PTRACE_POKEDATA, p->pid, (void *)(uintptr_t)word_address,
                    (void *)(uintptr_t)word) == -1) {
