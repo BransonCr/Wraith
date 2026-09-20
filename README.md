@@ -1,5 +1,12 @@
 # Wraith v0.1.0 - Summary
 
+
+###Update!
+I"ve been really busy with other stuff so I haven't been able to work on this project directly. Also, a video in the works to fully explain this
+project and get people to understand the absolute insanity that is debugging and how much work goes into it!
+Take a look at my channel (with no videos yet lol) but I swear in 12-24 months it's gonna be sweet (haha).
+Look at my channel here https://www.youtube.com/@FairFlaxen
+
 **Wraith** is a native x64 debugger for Linux, written in C directly on the
 `ptrace` syscall. It uses no debugging libraries, the DWARF parser,
 disassembler, and stack unwinder are all hand written. It is built in the open
